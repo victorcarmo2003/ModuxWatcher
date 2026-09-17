@@ -25,12 +25,10 @@ const DEFAULT_INTERVAL_MS: u64 = 400;
     name = "modux",
     version,
     about = "Type generator for the Modux Roblox framework",
-    long_about = "Reads the project modules with luau-ast and writes the per-module \
-                  type leaves (Type.luau) and the Manifest.\n\n\
-                  Needs `luau-ast` on PATH. It ships inside the luau-lang/luau release \
-                  archive (luau-windows.zip, luau-ubuntu.zip, luau-macos.zip), next to \
-                  luau-analyze. `rokit add luau-lang/luau` does NOT provide it: rokit \
-                  keeps one binary per tool and that one is `luau`."
+    long_about = "Reads the project modules and writes the per-module type \
+                  leaves (Type.luau) and the Manifest.\n\n\
+                  Parsing is built in, so there is nothing to install alongside \
+                  this binary."
 )]
 struct Cli {
     #[arg(long, short, global = true, value_name = "PATH")]
@@ -100,10 +98,10 @@ fn run(cli: &Cli) -> Result<()> {
                 return Ok(());
             }
             for p in &stale {
-                eprintln!("stale: {}", p.display());
+                eprintln!("stale: {}", state.rel(p));
             }
             bail!(
-                "{} file(s) desatualizado(s). Run `modux generate`.",
+                "{} file(s) out of date. Run `modux generate`.",
                 stale.len()
             )
         }
@@ -314,23 +312,23 @@ impl State {
             }
         }
 
-        for (side, destino) in self.targets.clone() {
+        for (side, target) in self.targets.clone() {
             let Some(text) = manifest::emit(side, &modules, &sides, &self.map)? else {
                 continue;
             };
-            if Self::write_if_changed(&destino, &text)? {
+            if Self::write_if_changed(&target, &text)? {
                 let n = modules.iter().filter(|m| side.sees(sides[&m.id])).count();
-                log(&format!("manifest {}: {} ({n} modules)", side.name(), self.rel(&destino)));
+                log(&format!("manifest {}: {} ({n} modules)", side.name(), self.rel(&target)));
                 changed = true;
             }
         }
 
-        for (side, destino) in self.module_lists.clone() {
+        for (side, target) in self.module_lists.clone() {
             let Some(text) = manifest::emit_module_list(side, &modules, &sides, &self.map)? else {
                 continue;
             };
-            if Self::write_if_changed(&destino, &text)? {
-                log(&format!("modules {}: {}", side.name(), self.rel(&destino)));
+            if Self::write_if_changed(&target, &text)? {
+                log(&format!("modules {}: {}", side.name(), self.rel(&target)));
                 changed = true;
             }
         }
@@ -360,20 +358,20 @@ impl State {
                 stale.push(leaf);
             }
         }
-        for (side, destino) in self.targets.clone() {
+        for (side, target) in self.targets.clone() {
             let Some(text) = manifest::emit(side, &modules, &sides, &self.map)? else {
                 continue;
             };
-            if std::fs::read_to_string(&destino).ok().as_deref() != Some(text.as_str()) {
-                stale.push(destino);
+            if std::fs::read_to_string(&target).ok().as_deref() != Some(text.as_str()) {
+                stale.push(target);
             }
         }
-        for (side, destino) in self.module_lists.clone() {
+        for (side, target) in self.module_lists.clone() {
             let Some(text) = manifest::emit_module_list(side, &modules, &sides, &self.map)? else {
                 continue;
             };
-            if std::fs::read_to_string(&destino).ok().as_deref() != Some(text.as_str()) {
-                stale.push(destino);
+            if std::fs::read_to_string(&target).ok().as_deref() != Some(text.as_str()) {
+                stale.push(target);
             }
         }
         Ok(stale)

@@ -1,12 +1,17 @@
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
+use full_moon::ast::{
+    Assignment, Ast, Call, Expression, FunctionArgs, FunctionBody, FunctionCall, Index, Parameter,
+    Prefix, Stmt, Suffix, Var, VarExpression,
+};
+use full_moon::node::Node;
+use full_moon::tokenizer::TokenReference;
+use full_moon::visitors::{Visit, Visitor};
 use serde::Serialize;
-use serde_json::Value;
 
-use crate::ast::{self, walk, is_local, indexes, list, text, kind_of, Source};
+use crate::ast::{self, span};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Issue {
@@ -60,125 +65,251 @@ pub struct Module {
     pub issues: Vec<Issue>,
 }
 
-fn literal(t: &str) -> Option<&'static str> {
-    match t {
-        "AstExprConstantString" => Some("string"),
-        "AstExprConstantNumber" => Some("number"),
-        "AstExprConstantBool" => Some("boolean"),
+fn name_of(token: &TokenReference) -> String {
+    token.token().to_string()
+}
+
+fn string_value(expr: &Expression) -> Option<String> {
+    let Expression::String(token) = expr else {
+        return None;
+    };
+    let raw = token.token().to_string();
+    let opener = raw.chars().next()?;
+    let quoted = raw.len() >= 2 && (opener == '"' || opener == '\'') && raw.ends_with(opener);
+    Some(if quoted {
+        raw[1..raw.len() - 1].to_string()
+    } else {
+        raw
+    })
+}
+
+fn param_name(p: &Parameter) -> String {
+    match p {
+        Parameter::Name(t) => name_of(t),
+        _ => "...".to_string(),
+    }
+}
+
+/// One link of a call or index chain, flattened so that `a.b:c(x)` reads as
+/// [Dot("b"), Method("c", args)] regardless of which node type it came from.
+enum Step<'a> {
+    Dot(String),
+    Method(String, &'a FunctionArgs),
+    Call(&'a FunctionArgs),
+    Other,
+}
+
+fn steps<'a>(suffixes: impl Iterator<Item = &'a Suffix>) -> Vec<Step<'a>> {
+    suffixes
+        .map(|s| match s {
+            Suffix::Index(Index::Dot { name, .. }) => Step::Dot(name_of(name)),
+            Suffix::Call(Call::MethodCall(m)) => Step::Method(name_of(m.name()), m.args()),
+            Suffix::Call(Call::AnonymousCall(args)) => Step::Call(args),
+            _ => Step::Other,
+        })
+        .collect()
+}
+
+fn prefix_name(prefix: &Prefix) -> Option<String> {
+    match prefix {
+        Prefix::Name(t) => Some(name_of(t)),
         _ => None,
+    }
+}
+
+fn arguments(args: &FunctionArgs) -> Vec<&Expression> {
+    match args {
+        FunctionArgs::Parentheses { arguments, .. } => arguments.iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `local x = ...` and `const x = ...` bind the same way; the extractor does not
+/// care which keyword was used.
+fn binding(st: &Stmt) -> Option<(Vec<String>, Vec<&Expression>)> {
+    match st {
+        Stmt::LocalAssignment(l) => Some((
+            l.names().iter().map(name_of).collect(),
+            l.expressions().iter().collect(),
+        )),
+        Stmt::ConstAssignment(c) => Some((
+            c.names().iter().map(name_of).collect(),
+            c.expressions().iter().collect(),
+        )),
+        _ => None,
+    }
+}
+
+/// `self.Dependencies.X`, in any position, whether or not it ends in a call.
+fn dependency_read(prefix: &Prefix, chain: &[Step]) -> Option<String> {
+    if prefix_name(prefix).as_deref() != Some("self") {
+        return None;
+    }
+    match (chain.first(), chain.get(1)) {
+        (Some(Step::Dot(outer)), Some(Step::Dot(inner))) if outer == "Dependencies" => {
+            Some(inner.clone())
+        }
+        _ => None,
+    }
+}
+
+/// `self.X`, exactly one level deep.
+fn self_field(var: &VarExpression) -> Option<String> {
+    if prefix_name(var.prefix()).as_deref() != Some("self") {
+        return None;
+    }
+    match steps(var.suffixes()).as_slice() {
+        [Step::Dot(name)] => Some(name.clone()),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct BodyScan {
+    assignments: Vec<(String, Expression)>,
+    deps: BTreeSet<String>,
+}
+
+impl Visitor for BodyScan {
+    fn visit_assignment(&mut self, node: &Assignment) {
+        for (var, value) in node.variables().iter().zip(node.expressions().iter()) {
+            if let Var::Expression(ve) = var {
+                if let Some(name) = self_field(ve) {
+                    self.assignments.push((name, value.clone()));
+                }
+            }
+        }
+    }
+
+    fn visit_var_expression(&mut self, node: &VarExpression) {
+        if let Some(d) = dependency_read(node.prefix(), &steps(node.suffixes())) {
+            self.deps.insert(d);
+        }
+    }
+
+    fn visit_function_call(&mut self, node: &FunctionCall) {
+        if let Some(d) = dependency_read(node.prefix(), &steps(node.suffixes())) {
+            self.deps.insert(d);
+        }
     }
 }
 
 pub struct Extractor {
     path: PathBuf,
-    fonte: Source,
-    root: Vec<Value>,
+    ast: Ast,
     issues: Vec<Issue>,
 }
 
 impl Extractor {
     pub fn new(path: &Path) -> Result<Self> {
-        let (root, fonte) = ast::parse(path)?;
         Ok(Self {
             path: path.to_path_buf(),
-            fonte,
-            root,
+            ast: ast::parse(path)?,
             issues: Vec::new(),
         })
     }
 
-    fn type_text(&self, annotation: &Value) -> String {
-        self.fonte.slice(text(annotation, "location")).trim().to_string()
-    }
-
-    fn issue(&mut self, node: &Value, msg: String) {
-        let loc = text(node, "location");
-        let started = loc.split('-').next().unwrap_or("0,0").trim();
-        let mut parts = started.split(',');
-        let line: usize = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-        let column: usize = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    fn issue<T: Node>(&mut self, node: &T, message: String) {
+        let at = node.start_position();
         self.issues.push(Issue {
-            line: line + 1,
-            column: column + 1,
-            message: msg,
+            line: at.map(|p| p.line()).unwrap_or(0),
+            column: at.map(|p| p.character()).unwrap_or(0),
+            message,
         });
     }
 
-    fn value_type(&mut self, value: &Value, where_at: &str) -> Option<String> {
-        let t = kind_of(value);
-        if t == "AstExprTypeAssertion" {
-            return value.get("annotation").map(|a| self.type_text(a));
-        }
-        if let Some(prim) = literal(t) {
-            return Some(prim.to_string());
-        }
-        if t == "AstExprFunction" {
-            return Some(self.signature(value, false));
+    fn value_type(&mut self, value: &Expression, where_at: &str) -> Option<String> {
+        match value {
+            Expression::TypeAssertion { type_assertion, .. } => {
+                return Some(span(type_assertion.cast_to()))
+            }
+            Expression::String(_) => return Some("string".to_string()),
+            Expression::Number(_) => return Some("number".to_string()),
+            Expression::Symbol(t) => {
+                let s = name_of(t);
+                if s == "true" || s == "false" {
+                    return Some("boolean".to_string());
+                }
+            }
+            Expression::Function(f) => return Some(self.signature(f.body(), false, false)),
+            _ => {}
         }
         self.issue(
             value,
-            format!("{where_at} has no type. Annotate it with `::` so the generator can transcribe it."),
+            format!(
+                "{where_at} has no type. Annotate it with `::` so the generator can transcribe it."
+            ),
         );
         None
     }
 
-    fn signature(&mut self, func: &Value, with_self: bool) -> String {
-        let all_args = list(func, "args").to_vec();
+    /// `with_self` prepends the receiver. `colon` says the declaration used
+    /// method syntax, where `self` is implicit and there is no first parameter
+    /// to drop; with dot syntax an explicit `self` parameter is that same
+    /// receiver spelled out, so it goes.
+    fn signature(&mut self, body: &FunctionBody, colon: bool, with_self: bool) -> String {
+        let params: Vec<&Parameter> = body.parameters().iter().collect();
+        let types: Vec<_> = body.type_specifiers().collect();
+
         let mut parts = Vec::new();
-
-        let args: Vec<Value> = if with_self {
+        let mut first = 0;
+        if with_self {
             parts.push("self: Public".to_string());
-            let implicit_self = func.get("self").map_or(true, Value::is_null);
-            let first_arg_e_self = all_args.first().map(|a| text(a, "name")) == Some("self");
-            if implicit_self && first_arg_e_self {
-                all_args[1..].to_vec()
-            } else {
-                all_args
+            if !colon && params.first().map(|p| param_name(p)).as_deref() == Some("self") {
+                first = 1;
             }
-        } else {
-            all_args
-        };
+        }
 
-        for arg in &args {
-            let name = text(arg, "name").to_string();
-            match arg.get("luauType").filter(|v| !v.is_null()) {
-                Some(anot) => parts.push(format!("{name}: {}", self.type_text(anot))),
+        for i in first..params.len() {
+            let name = param_name(params[i]);
+            match types.get(i).copied().flatten() {
+                Some(ts) => parts.push(format!("{name}: {}", span(ts.type_info()))),
                 None => {
-                    self.issue(func, format!("parametro `{name}` sem annotation de kind_of."));
+                    self.issue(body, format!("parameter `{name}` has no type annotation."));
                     parts.push(format!("{name}: unknown"));
                 }
             }
         }
 
-        format!("({}) -> {}", parts.join(", "), self.return_type(func))
-    }
-
-    fn return_type(&self, func: &Value) -> String {
-        match func.get("returnAnnotation").filter(|v| !v.is_null()) {
-            Some(ret) => self.type_text(ret),
+        let returns = match body.return_type() {
+            Some(ts) => span(ts.type_info()),
             None => "()".to_string(),
-        }
+        };
+        format!("({}) -> {returns}", parts.join(", "))
     }
 
     pub fn run(mut self) -> Result<Module> {
         let Some((local_name, id, declared_require, kind)) = self.declaration() else {
             bail!(
-                "{}: nenhuma call a Controller, Service ou Component encontrada",
+                "{}: no call to Controller, Service or Component found",
                 self.path.display()
             );
         };
+
+        let statements: Vec<Stmt> = self.ast.nodes().stmts().cloned().collect();
 
         let mut methods = Vec::new();
         let mut fields: BTreeMap<String, String> = BTreeMap::new();
         let mut deps: BTreeSet<String> = BTreeSet::new();
 
-        for st in self.root.clone() {
-            let Some((name, func)) = Self::method_body(&st, &local_name) else {
+        for st in &statements {
+            let Some((name, body, colon)) = Self::method_body(st, &local_name) else {
                 continue;
             };
-            let signature = self.signature(&func, true);
+            let signature = self.signature(&body, colon, true);
             methods.push(Method { name, signature });
-            self.scan_body(&func, &mut fields, &mut deps);
+
+            let mut scan = BodyScan::default();
+            body.block().visit(&mut scan);
+            deps.extend(scan.deps);
+            for (field, value) in scan.assignments {
+                if fields.contains_key(&field) {
+                    continue;
+                }
+                if let Some(ty) = self.value_type(&value, &format!("self.{field}")) {
+                    fields.insert(field, ty);
+                }
+            }
         }
 
         Ok(Module {
@@ -200,154 +331,113 @@ impl Extractor {
     }
 
     fn declaration(&self) -> Option<(String, String, Vec<String>, String)> {
-        for st in &self.root {
-            if kind_of(st) != "AstStatLocal" {
-                continue;
-            }
-            let Some(call) = list(st, "values").first() else {
+        for st in self.ast.nodes().stmts() {
+            let Some((names, values)) = binding(st) else {
                 continue;
             };
-            if kind_of(call) != "AstExprCall" {
+            let Some(Expression::FunctionCall(call)) = values.first() else {
+                continue;
+            };
+            let chain = steps(call.suffixes());
+            let [Step::Dot(kind), Step::Call(args)] = chain.as_slice() else {
+                continue;
+            };
+            if !matches!(kind.as_str(), "Controller" | "Service" | "Component") {
                 continue;
             }
-            let func = call.get("func")?;
-            if kind_of(func) != "AstExprIndexName" {
-                continue;
-            }
-            let kind = text(func, "index");
-            if !matches!(kind, "Controller" | "Service" | "Component") {
-                continue;
-            }
-            let args = list(call, "args");
-            let first_arg = args.first()?;
-            if kind_of(first_arg) != "AstExprConstantString" {
-                continue;
-            }
-            let local_name = list(st, "vars").first().map(|v| text(v, "name"))?.to_string();
-            return Some((
-                local_name,
-                text(first_arg, "value").to_string(),
-                Self::require_from_props(args),
-                kind.to_string(),
-            ));
+            let args = arguments(args);
+            let id = args.first().and_then(|a| string_value(a))?;
+            let local_name = names.first()?.clone();
+            return Some((local_name, id, Self::require_from_props(&args), kind.clone()));
         }
         None
     }
 
-    fn require_from_props(args: &[Value]) -> Vec<String> {
-        let Some(props) = args.get(1).filter(|p| kind_of(p) == "AstExprTable") else {
+    fn require_from_props(args: &[&Expression]) -> Vec<String> {
+        let Some(Expression::TableConstructor(props)) = args.get(1) else {
             return Vec::new();
         };
-        for item in list(props, "items") {
-            let key = item.get("key").map(|k| text(k, "value")).unwrap_or("");
-            if key != "Require" {
+        for field in props.fields() {
+            let full_moon::ast::Field::NameKey { key, value, .. } = field else {
+                continue;
+            };
+            if name_of(key) != "Require" {
                 continue;
             }
-            let Some(v) = item.get("value") else { continue };
-            if kind_of(v) == "AstExprConstantString" {
-                return vec![text(v, "value").to_string()];
+            if let Some(one) = string_value(value) {
+                return vec![one];
             }
-            if kind_of(v) == "AstExprTable" {
-                return list(v, "items")
+            if let Expression::TableConstructor(list) = value {
+                return list
+                    .fields()
                     .iter()
-                    .filter_map(|i| i.get("value"))
-                    .filter(|val| kind_of(val) == "AstExprConstantString")
-                    .map(|val| text(val, "value").to_string())
+                    .filter_map(|f| match f {
+                        full_moon::ast::Field::NoKey(v) => string_value(v),
+                        _ => None,
+                    })
                     .collect();
             }
         }
         Vec::new()
     }
 
-    fn method_body(st: &Value, target: &str) -> Option<(String, Value)> {
-        if kind_of(st) == "AstStatFunction" {
-            let name = st.get("name")?;
-            if kind_of(name) == "AstExprIndexName" && is_local(name.get("expr")?, target) {
-                return Some((text(name, "index").to_string(), st.get("func")?.clone()));
+    fn method_body(st: &Stmt, target: &str) -> Option<(String, FunctionBody, bool)> {
+        if let Stmt::FunctionDeclaration(f) = st {
+            let names: Vec<String> = f.name().names().iter().map(name_of).collect();
+            if let Some(method) = f.name().method_name() {
+                if names.as_slice() == [target] {
+                    return Some((name_of(method), f.body().clone(), true));
+                }
+            } else if names.len() == 2 && names[0] == target {
+                return Some((names[1].clone(), f.body().clone(), false));
             }
         }
-        if kind_of(st) == "AstStatAssign" {
-            let var = list(st, "vars").first()?;
-            let val = list(st, "values").first()?;
-            if kind_of(var) == "AstExprIndexName"
-                && is_local(var.get("expr")?, target)
-                && kind_of(val) == "AstExprFunction"
-            {
-                return Some((text(var, "index").to_string(), val.clone()));
+
+        if let Stmt::Assignment(a) = st {
+            let var = a.variables().iter().next()?;
+            let value = a.expressions().iter().next()?;
+            let Var::Expression(ve) = var else {
+                return None;
+            };
+            if prefix_name(ve.prefix()).as_deref() != Some(target) {
+                return None;
+            }
+            let chain = steps(ve.suffixes());
+            let [Step::Dot(name)] = chain.as_slice() else {
+                return None;
+            };
+            if let Expression::Function(f) = value {
+                return Some((name.clone(), f.body().clone(), false));
             }
         }
+
         None
-    }
-
-    fn scan_body(
-        &mut self,
-        func: &Value,
-        fields: &mut BTreeMap<String, String>,
-        deps: &mut BTreeSet<String>,
-    ) {
-        let mut atribuicoes: Vec<(String, Value)> = Vec::new();
-        if let Some(body) = func.get("body") {
-            walk(body, &mut |node: &Value| {
-                if kind_of(node) == "AstStatAssign" {
-                    let vars = list(node, "vars");
-                    let vals = list(node, "values");
-                    for (var, val) in vars.iter().zip(vals.iter()) {
-                        if kind_of(var) != "AstExprIndexName" {
-                            continue;
-                        }
-                        let Some(inside) = var.get("expr") else { continue };
-                        if !is_local(inside, "self") {
-                            continue;
-                        }
-                        atribuicoes.push((text(var, "index").to_string(), val.clone()));
-                    }
-                }
-                if kind_of(node) == "AstExprIndexName" {
-                    if let Some(inside) = node.get("expr") {
-                        if indexes(inside, "Dependencies")
-                            && inside.get("expr").is_some_and(|e| is_local(e, "self"))
-                        {
-                            deps.insert(text(node, "index").to_string());
-                        }
-                    }
-                }
-            });
-        }
-
-        for (name, value) in atribuicoes {
-            if fields.contains_key(&name) {
-                continue;
-            }
-            if let Some(t) = self.value_type(&value, &format!("self.{name}")) {
-                fields.insert(name, t);
-            }
-        }
     }
 
     fn services(&self) -> Vec<Service> {
         let mut out = Vec::new();
-        for st in &self.root {
-            if kind_of(st) != "AstStatLocal" {
+        for st in self.ast.nodes().stmts() {
+            let Some((names, values)) = binding(st) else {
                 continue;
-            }
-            let Some(v) = list(st, "values").first() else { continue };
-            if kind_of(v) != "AstExprCall" {
+            };
+            let Some(Expression::FunctionCall(call)) = values.first() else {
                 continue;
-            }
-            let Some(func) = v.get("func") else { continue };
-            if kind_of(func) != "AstExprIndexName" || text(func, "index") != "GetService" {
+            };
+            let chain = steps(call.suffixes());
+            let args = match chain.as_slice() {
+                [Step::Method(name, args)] if name == "GetService" => *args,
+                [Step::Dot(name), Step::Call(args)] if name == "GetService" => *args,
+                _ => continue,
+            };
+            let Some(service) = arguments(args).first().and_then(|a| string_value(a)) else {
                 continue;
-            }
-            let Some(arg) = list(v, "args").first() else { continue };
-            if kind_of(arg) != "AstExprConstantString" {
-                continue;
-            }
-            let Some(alias) = list(st, "vars").first().map(|x| text(x, "name")) else {
+            };
+            let Some(alias) = names.first() else {
                 continue;
             };
             out.push(Service {
-                alias: alias.to_string(),
-                service: text(arg, "value").to_string(),
+                alias: alias.clone(),
+                service,
             });
         }
         out
@@ -355,41 +445,47 @@ impl Extractor {
 
     fn requires(&self) -> Vec<Import> {
         let mut out = Vec::new();
-        for st in &self.root {
-            if kind_of(st) != "AstStatLocal" {
+        for st in self.ast.nodes().stmts() {
+            let Some((names, values)) = binding(st) else {
+                continue;
+            };
+            let Some(Expression::FunctionCall(call)) = values.first() else {
+                continue;
+            };
+            if prefix_name(call.prefix()).as_deref() != Some("require") {
                 continue;
             }
-            let Some(v) = list(st, "values").first() else { continue };
-            if kind_of(v) != "AstExprCall" {
+            let chain = steps(call.suffixes());
+            let [Step::Call(args)] = chain.as_slice() else {
                 continue;
-            }
-            let Some(func) = v.get("func") else { continue };
-            let eh_require = (kind_of(func) == "AstExprGlobal" && text(func, "global") == "require")
-                || (kind_of(func) == "AstExprLocal"
-                    && func.get("local").map(|l| text(l, "name")) == Some("require"));
-            if !eh_require {
+            };
+            let Some(arg) = arguments(args).first().copied() else {
                 continue;
-            }
-            let Some(arg) = list(v, "args").first() else { continue };
-            let Some(alias) = list(st, "vars").first().map(|x| text(x, "name")) else {
+            };
+            let Some(alias) = names.first() else {
                 continue;
             };
             out.push(Import {
-                alias: alias.to_string(),
-                expr: self.fonte.slice(text(arg, "location")).trim().to_string(),
+                alias: alias.clone(),
+                expr: span(arg),
             });
         }
         out
     }
 
     fn local_types(&self) -> Vec<LocalType> {
-        self.root
-            .iter()
-            .filter(|st| kind_of(st) == "AstStatTypeAlias")
-            .map(|st| LocalType {
-                name: text(st, "name").to_string(),
-                text: self.fonte.slice(text(st, "location")).trim().to_string(),
-            })
-            .collect()
+        let mut out = Vec::new();
+        for st in self.ast.nodes().stmts() {
+            let name = match st {
+                Stmt::TypeDeclaration(d) => name_of(d.type_name()),
+                Stmt::ExportedTypeDeclaration(e) => name_of(e.type_declaration().type_name()),
+                _ => continue,
+            };
+            out.push(LocalType {
+                name,
+                text: span(st),
+            });
+        }
+        out
     }
 }

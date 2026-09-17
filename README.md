@@ -27,8 +27,10 @@ Run `rokit add victorcarmo2003/modux` to install and trust this tool.
 É só rodar o mesmo comando de novo num terminal interativo e aceitar. Em CI, use
 `rokit trust victorcarmo2003/modux` antes do `rokit install`.
 
-O `luau-ast` vem no pacote `luau-lang/luau` e é **obrigatório** — é ele que parseia.
-O mesmo pacote traz o `luau-analyze`, que você vai querer de qualquer jeito.
+Não tem mais nada para instalar: o parser de Luau é compilado dentro do binário.
+Versões até a 0.1 dependiam do `luau-ast` no PATH, o que não dava para resolver com
+o Rokit — ele guarda um binário por ferramenta, e no pacote `luau-lang/luau` esse
+binário é o `luau`.
 
 ## Comandos
 
@@ -132,14 +134,17 @@ vira `require(script.Parent.X)` na folha, automaticamente.
 
 ## Desempenho
 
-Cache de extração por arquivo, chaveado por mtime e tamanho. Cada invocação do
-`luau-ast` custa dezenas de milissegundos e o binário aceita um arquivo por vez,
-então reextrair tudo a cada save custaria N vezes isso.
+Cache de extração por arquivo, chaveado por mtime e tamanho, para não reparsear
+o projeto inteiro a cada save.
 
 | | |
 |---|---|
-| regerar folha e Manifest depois de um save | ~57 ms |
-| build frio, 3 módulos | ~130 ms |
+| build frio, 7 módulos, folhas e os dois Manifests | ~80 ms |
+| `modux check` nos mesmos 7 módulos | ~78 ms |
+
+Esses números são do cronômetro interno e não contam a partida do processo, que
+no Windows sozinha custa ~150 ms de relógio. Em `watch` o processo já está de pé,
+então o que você sente é o número da tabela.
 
 ## Licença
 
