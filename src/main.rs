@@ -1,8 +1,3 @@
-//! CLI do gerador de tipos do Modux.
-//!
-//! Voce escreve o corpo do modulo; o modux escreve a folha de tipos e o
-//! Manifest. Nao ha inferencia: ele le a anotacao que voce escreveu e alarga
-//! literal. Se o modux sumir, o codigo continua Luau valido que roda.
 
 mod ast;
 mod emit;
@@ -18,404 +13,390 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use walkdir::WalkDir;
 
-use extract::{Extrator, Modulo};
-use rojo::Mapa;
+use extract::{Extractor, Module};
+use rojo::Map;
 
-const PROJETO: &str = "default.project.json";
-const FONTE: &str = "src";
-const INTERVALO_PADRAO_MS: u64 = 400;
+const PROJECT: &str = "default.project.json";
+const SOURCE: &str = "src";
+const DEFAULT_INTERVAL_MS: u64 = 400;
 
 #[derive(Parser)]
 #[command(
     name = "modux",
     version,
-    about = "Gerador de tipos do framework Modux para Roblox",
-    long_about = "Le os modulos do projeto com o luau-ast e escreve as folhas de \
-                  tipo (Type.luau) e o Manifest.\n\n\
-                  Precisa do `luau-ast` no PATH:  rokit add luau-lang/luau"
+    about = "Type generator for the Modux Roblox framework",
+    long_about = "Le os modules do project com o luau-ast e escreve as folhas de \
+                  kind_of (Type.luau) e o Manifest.\n\n\
+                  Precisa do `luau-ast` node PATH:  rokit add luau-lang/luau"
 )]
 struct Cli {
-    /// Raiz do projeto. Por padrao procura o default.project.json subindo a partir do diretorio atual.
-    #[arg(long, short, global = true, value_name = "CAMINHO")]
-    projeto: Option<PathBuf>,
+    #[arg(long, short, global = true, value_name = "PATH")]
+    project: Option<PathBuf>,
 
     #[command(subcommand)]
-    comando: Comando,
+    command: Command,
 }
 
 #[derive(Subcommand)]
-enum Comando {
-    /// Regera tudo uma vez e sai.
+enum Command {
     Generate,
 
-    /// Observa `src/` e regera o que mudar.
     Watch {
-        /// Intervalo entre checagens, em milissegundos.
-        #[arg(long, default_value_t = INTERVALO_PADRAO_MS)]
-        intervalo: u64,
+        #[arg(long, default_value_t = DEFAULT_INTERVAL_MS)]
+        interval: u64,
     },
 
-    /// Verifica se o que esta no disco bate com o que seria gerado. Nao escreve.
-    /// Sai com codigo 1 quando algo esta desatualizado — serve para CI e pre-commit.
     Check,
 
-    /// Lista os modulos encontrados e suas dependencias.
     List,
 
-    /// Despeja o que o extrator ve num modulo, em JSON. Para depurar.
     Extract {
-        /// Arquivo do modulo (o `init.luau`).
-        arquivo: PathBuf,
+        file: PathBuf,
     },
 }
 
 fn main() {
     let cli = Cli::parse();
-    if let Err(erro) = rodar(&cli) {
-        eprintln!("modux: {erro:#}");
+    if let Err(err) = run(&cli) {
+        eprintln!("modux: {err:#}");
         std::process::exit(1);
     }
 }
 
-fn rodar(cli: &Cli) -> Result<()> {
-    match &cli.comando {
-        Comando::Extract { arquivo } => {
-            let dados = Extrator::novo(arquivo)?.rodar()?;
+fn run(cli: &Cli) -> Result<()> {
+    match &cli.command {
+        Command::Extract { file } => {
+            let dados = Extractor::new(file)?.run()?;
             println!("{}", serde_json::to_string_pretty(&dados)?);
             Ok(())
         }
-        Comando::Generate => {
-            let raiz = raiz_do_projeto(cli)?;
-            let mut estado = Estado::novo(&raiz)?;
-            let inicio = Instant::now();
-            let mudou = estado.passada(true)?;
+        Command::Generate => {
+            let root = project_root(cli)?;
+            let mut state = State::is_new(&root)?;
+            let started = Instant::now();
+            let mudou = state.pass(true)?;
             if !mudou {
-                log("tudo em dia");
+                log("up to date");
             }
-            log(&format!("{} ms", inicio.elapsed().as_millis()));
+            log(&format!("{} ms", started.elapsed().as_millis()));
             Ok(())
         }
-        Comando::Check => {
-            let raiz = raiz_do_projeto(cli)?;
-            let mut estado = Estado::novo(&raiz)?;
-            let pendentes = estado.conferir()?;
-            if pendentes.is_empty() {
-                log("tudo em dia");
+        Command::Check => {
+            let root = project_root(cli)?;
+            let mut state = State::is_new(&root)?;
+            let stale = state.check_stale()?;
+            if stale.is_empty() {
+                log("up to date");
                 return Ok(());
             }
-            for p in &pendentes {
-                eprintln!("desatualizado: {}", p.display());
+            for p in &stale {
+                eprintln!("stale: {}", p.display());
             }
             bail!(
-                "{} arquivo(s) desatualizado(s). Rode `modux generate`.",
-                pendentes.len()
+                "{} file(s) desatualizado(s). Run `modux generate`.",
+                stale.len()
             )
         }
-        Comando::List => {
-            let raiz = raiz_do_projeto(cli)?;
-            let mut estado = Estado::novo(&raiz)?;
-            for m in estado.modulos()? {
-                let deps = if m.dependencias.is_empty() {
+        Command::List => {
+            let root = project_root(cli)?;
+            let mut state = State::is_new(&root)?;
+            for m in state.modules()? {
+                let deps = if m.dependencies.is_empty() {
                     "-".to_string()
                 } else {
-                    m.dependencias.join(", ")
+                    m.dependencies.join(", ")
                 };
-                println!("{:<12} {:<10} {}  deps: {}", m.id, m.especie, m.arquivo, deps);
+                println!("{:<12} {:<10} {}  deps: {}", m.id, m.kind, m.file, deps);
             }
             Ok(())
         }
-        Comando::Watch { intervalo } => {
-            let raiz = raiz_do_projeto(cli)?;
-            let mut estado = Estado::novo(&raiz)?;
-            let inicio = Instant::now();
-            if !estado.passada(true)? {
-                log("tudo em dia");
+        Command::Watch { interval } => {
+            let root = project_root(cli)?;
+            let mut state = State::is_new(&root)?;
+            let started = Instant::now();
+            if !state.pass(true)? {
+                log("up to date");
             }
-            log(&format!("primeira passada em {} ms", inicio.elapsed().as_millis()));
-            observar(&mut estado, Duration::from_millis(*intervalo))
+            log(&format!("primeira pass em {} ms", started.elapsed().as_millis()));
+            watch_loop(&mut state, Duration::from_millis(*interval))
         }
     }
 }
 
-// ---- projeto ---------------------------------------------------------------
-
-fn raiz_do_projeto(cli: &Cli) -> Result<PathBuf> {
-    if let Some(p) = &cli.projeto {
-        if !p.join(PROJETO).exists() {
-            bail!("{} nao tem {PROJETO}", p.display());
+fn project_root(cli: &Cli) -> Result<PathBuf> {
+    if let Some(p) = &cli.project {
+        if !p.join(PROJECT).exists() {
+            bail!("{} has no {PROJECT}", p.display());
         }
         return Ok(p.clone());
     }
-    let mut atual = std::env::current_dir().context("nao consegui ler o diretorio atual")?;
+    let mut current = std::env::current_dir().context("could not read the current directory")?;
     loop {
-        if atual.join(PROJETO).exists() {
-            return Ok(atual);
+        if current.join(PROJECT).exists() {
+            return Ok(current);
         }
-        if !atual.pop() {
+        if !current.pop() {
             bail!(
-                "nao achei {PROJETO} aqui nem nos diretorios acima.\n\
-                 Rode dentro do projeto, ou passe --projeto CAMINHO."
+                "{PROJECT} not found here or in any parent directory.\n\
+                 Rode inside do project, ou passe --project PATH."
             );
         }
     }
 }
 
-/// Folha e Manifest sao saida nossa: observar geraria rodada em falso.
-fn eh_gerado(caminho: &Path, destino_manifest: &Path) -> bool {
-    if caminho.file_name().is_some_and(|n| n == "Type.luau") {
+fn is_generated(path: &Path, targets: &[PathBuf]) -> bool {
+    if path.file_name().is_some_and(|n| n == "Type.luau") {
         return true;
     }
-    match (caminho.canonicalize(), destino_manifest.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
+    let Ok(a) = path.canonicalize() else { return false };
+    targets.iter().any(|d| d.canonicalize().is_ok_and(|b| a == b))
 }
 
-/// Arquivos que chamam Controller, Service ou Component.
-fn achar_modulos(raiz: &Path, destino_manifest: &Path) -> Vec<PathBuf> {
-    let mut achados = Vec::new();
-    for entrada in WalkDir::new(raiz.join(FONTE)).into_iter().filter_map(Result::ok) {
-        let caminho = entrada.path();
-        if !caminho.is_file() || caminho.extension().is_none_or(|e| e != "luau") {
+fn find_modules(root: &Path, targets: &[PathBuf]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in WalkDir::new(root.join(SOURCE)).into_iter().filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_file() || path.extension().is_none_or(|e| e != "luau") {
             continue;
         }
-        if eh_gerado(caminho, destino_manifest) {
+        if is_generated(path, targets) {
             continue;
         }
-        // O proprio framework nao e um modulo do usuario.
-        if caminho.components().any(|c| c.as_os_str() == "Modux") {
+        if path.components().any(|c| c.as_os_str() == "Modux") {
             continue;
         }
-        let Ok(texto) = std::fs::read_to_string(caminho) else { continue };
-        if tem_chamada(&texto) {
-            achados.push(caminho.to_path_buf());
+        let Ok(text) = std::fs::read_to_string(path) else { continue };
+        if has_call(&text) {
+            found.push(path.to_path_buf());
         }
     }
-    achados.sort();
-    achados
+    found.sort();
+    found
 }
 
-/// Procura `.Controller(" / .Service(" / .Component("` sem precisar de regex.
-fn tem_chamada(texto: &str) -> bool {
-    for especie in ["Controller", "Service", "Component"] {
-        let alvo = format!(".{especie}");
+fn has_call(text: &str) -> bool {
+    for kind in ["Controller", "Service", "Component"] {
+        let target = format!(".{kind}");
         let mut i = 0;
-        while let Some(pos) = texto[i..].find(&alvo) {
-            let depois = &texto[i + pos + alvo.len()..];
-            let resto = depois.trim_start();
-            if resto.starts_with('(') {
-                let dentro = resto[1..].trim_start();
-                if dentro.starts_with('"') || dentro.starts_with('\'') {
+        while let Some(pos) = text[i..].find(&target) {
+            let after = &text[i + pos + target.len()..];
+            let remainder = after.trim_start();
+            if remainder.starts_with('(') {
+                let inside = remainder[1..].trim_start();
+                if inside.starts_with('"') || inside.starts_with('\'') {
                     return true;
                 }
             }
-            i += pos + alvo.len();
+            i += pos + target.len();
         }
     }
     false
 }
 
-// ---- estado ----------------------------------------------------------------
+type Signature = (SystemTime, u64);
 
-type Assinatura = (SystemTime, u64);
-
-struct Estado {
-    raiz: PathBuf,
-    mapa: Mapa,
-    destino: PathBuf,
-    /// caminho -> (assinatura, dados). Reextrai so o que mudou de verdade.
-    cache: BTreeMap<PathBuf, (Assinatura, Modulo)>,
+struct State {
+    root: PathBuf,
+    map: Map,
+    targets: Vec<(crate::rojo::Side, PathBuf)>,
+    cache: BTreeMap<PathBuf, (Signature, Module)>,
 }
 
-impl Estado {
-    fn novo(raiz: &Path) -> Result<Self> {
+impl State {
+    fn is_new(root: &Path) -> Result<Self> {
         Ok(Self {
-            raiz: raiz.to_path_buf(),
-            mapa: Mapa::ler(&raiz.join(PROJETO))?,
-            destino: manifest::destino(raiz),
+            root: root.to_path_buf(),
+            map: Map::read(&root.join(PROJECT))?,
+            targets: manifest::targets(root),
             cache: BTreeMap::new(),
         })
     }
 
-    fn assinatura(caminho: &Path) -> Option<Assinatura> {
-        let meta = std::fs::metadata(caminho).ok()?;
+    fn signature(path: &Path) -> Option<Signature> {
+        let meta = std::fs::metadata(path).ok()?;
         Some((meta.modified().ok()?, meta.len()))
     }
 
-    fn rel(&self, caminho: &Path) -> String {
-        caminho
-            .strip_prefix(&self.raiz)
-            .unwrap_or(caminho)
+    fn rel(&self, path: &Path) -> String {
+        path
+            .strip_prefix(&self.root)
+            .unwrap_or(path)
             .to_string_lossy()
             .replace('\\', "/")
     }
 
-    /// Reextrai so quando o arquivo mudou. Cada `luau-ast` custa dezenas de ms
-    /// e o binario aceita um arquivo por invocacao, entao reextrair o projeto
-    /// inteiro a cada save custaria N vezes isso.
-    fn extrair(&mut self, caminho: &Path) -> Result<(Modulo, bool)> {
-        let assin = Self::assinatura(caminho);
-        if let (Some(a), Some((anterior, dados))) = (assin, self.cache.get(caminho)) {
-            if *anterior == a {
+    fn extract(&mut self, path: &Path) -> Result<(Module, bool)> {
+        let assin = Self::signature(path);
+        if let (Some(a), Some((previous, dados))) = (assin, self.cache.get(path)) {
+            if *previous == a {
                 return Ok((dados.clone(), false));
             }
         }
-        let mut dados = Extrator::novo(caminho)?.rodar()?;
-        dados.arquivo = self.rel(caminho);
+        let mut dados = Extractor::new(path)?.run()?;
+        dados.file = self.rel(path);
         if let Some(a) = assin {
-            self.cache.insert(caminho.to_path_buf(), (a, dados.clone()));
+            self.cache.insert(path.to_path_buf(), (a, dados.clone()));
         }
         Ok((dados, true))
     }
 
-    fn modulos(&mut self) -> Result<Vec<Modulo>> {
-        let alvos = achar_modulos(&self.raiz, &self.destino);
-        let mut saida = Vec::new();
-        for alvo in alvos {
-            saida.push(self.extrair(&alvo)?.0);
+    fn modules(&mut self) -> Result<Vec<Module>> {
+        let targets_list = find_modules(&self.root, &self.paths());
+        let mut out = Vec::new();
+        for target in targets_list {
+            out.push(self.extract(&target)?.0);
         }
-        Ok(saida)
+        Ok(out)
     }
 
-    /// Escreve so quando o conteudo muda. O watcher depende disso para nao
-    /// disparar em si mesmo.
-    fn escrever(caminho: &Path, texto: &str) -> Result<bool> {
-        if let Ok(anterior) = std::fs::read_to_string(caminho) {
-            if anterior == texto {
+    fn write_if_changed(path: &Path, text: &str) -> Result<bool> {
+        if let Ok(previous) = std::fs::read_to_string(path) {
+            if previous == text {
                 return Ok(false);
             }
         }
-        if let Some(pai) = caminho.parent() {
+        if let Some(pai) = path.parent() {
             std::fs::create_dir_all(pai)?;
         }
-        std::fs::write(caminho, texto)
-            .with_context(|| format!("nao consegui escrever {}", caminho.display()))?;
+        std::fs::write(path, text)
+            .with_context(|| format!("could not write {}", path.display()))?;
         Ok(true)
     }
 
-    fn passada(&mut self, verboso: bool) -> Result<bool> {
-        let alvos = achar_modulos(&self.raiz, &self.destino);
-        let vistos: Vec<PathBuf> = alvos.clone();
-        self.cache.retain(|k, _| vistos.contains(k));
+    fn pass(&mut self, verboso: bool) -> Result<bool> {
+        let targets_list = find_modules(&self.root, &self.paths());
+        let seen: Vec<PathBuf> = targets_list.clone();
+        self.cache.retain(|k, _| seen.contains(k));
 
-        let mut modulos = Vec::new();
+        let mut modules = Vec::new();
         let mut mudou = false;
+        let mut pending_leaves: Vec<(PathBuf, Module)> = Vec::new();
 
-        for alvo in &alvos {
-            let (dados, novo) = self.extrair(alvo)?;
-            if novo || verboso {
-                for p in &dados.problemas {
+        for target in &targets_list {
+            let (dados, is_new) = self.extract(target)?;
+            if is_new || verboso {
+                for p in &dados.issues {
                     eprintln!(
                         "[modux] {}:{}:{} {}",
-                        dados.arquivo, p.linha, p.coluna, p.mensagem
+                        dados.file, p.line, p.column, p.message
                     );
                 }
             }
-            if novo {
-                let folha = emit::caminho_da_folha(alvo);
-                if Self::escrever(&folha, &emit::emitir(&dados))? {
-                    log(&format!("folha: {}", self.rel(&folha)));
-                    mudou = true;
-                }
+            if is_new {
+                pending_leaves.push((target.clone(), dados.clone()));
             }
-            modulos.push(dados);
+            modules.push(dados);
         }
 
-        if modulos.is_empty() {
-            bail!("nenhum modulo Modux encontrado em {FONTE}/");
+        if modules.is_empty() {
+            bail!("no Modux module found in {SOURCE}/");
         }
 
-        let texto = manifest::emitir(&modulos, &self.mapa)?;
-        if Self::escrever(&self.destino, &texto)? {
-            log(&format!(
-                "manifest: {} ({} modulos)",
-                self.rel(&self.destino),
-                modulos.len()
-            ));
-            mudou = true;
+        let sides = manifest::validate(&modules, &self.map)?;
+
+        for (target, dados) in &pending_leaves {
+            let leaf = emit::leaf_path(target);
+            if Self::write_if_changed(&leaf, &emit::emit(dados))? {
+                log(&format!("leaf: {}", self.rel(&leaf)));
+                mudou = true;
+            }
+        }
+
+        for (side, destino) in self.targets.clone() {
+            let Some(text) = manifest::emit(side, &modules, &sides, &self.map)? else {
+                continue;
+            };
+            if Self::write_if_changed(&destino, &text)? {
+                let n = modules.iter().filter(|m| side.sees(sides[&m.id])).count();
+                log(&format!("manifest {}: {} ({n} modules)", side.name(), self.rel(&destino)));
+                mudou = true;
+            }
         }
 
         Ok(mudou)
     }
 
-    /// Como `passada`, mas sem escrever: devolve o que sairia diferente.
-    fn conferir(&mut self) -> Result<Vec<PathBuf>> {
-        let modulos = self.modulos()?;
-        if modulos.is_empty() {
-            bail!("nenhum modulo Modux encontrado em {FONTE}/");
-        }
-        let mut pendentes = Vec::new();
+    fn paths(&self) -> Vec<PathBuf> {
+        self.targets.iter().map(|(_, p)| p.clone()).collect()
+    }
 
-        for m in &modulos {
-            let folha = emit::caminho_da_folha(&self.raiz.join(&m.arquivo));
-            let esperado = emit::emitir(m);
-            if std::fs::read_to_string(&folha).ok().as_deref() != Some(esperado.as_str()) {
-                pendentes.push(folha);
+    fn check_stale(&mut self) -> Result<Vec<PathBuf>> {
+        let modules = self.modules()?;
+        if modules.is_empty() {
+            bail!("no Modux module found in {SOURCE}/");
+        }
+        let mut stale = Vec::new();
+
+        let sides = manifest::validate(&modules, &self.map)?;
+
+        for m in &modules {
+            let leaf = emit::leaf_path(&self.root.join(&m.file));
+            let expected = emit::emit(m);
+            if std::fs::read_to_string(&leaf).ok().as_deref() != Some(expected.as_str()) {
+                stale.push(leaf);
             }
         }
-
-        let texto = manifest::emitir(&modulos, &self.mapa)?;
-        if std::fs::read_to_string(&self.destino).ok().as_deref() != Some(texto.as_str()) {
-            pendentes.push(self.destino.clone());
+        for (side, destino) in self.targets.clone() {
+            let Some(text) = manifest::emit(side, &modules, &sides, &self.map)? else {
+                continue;
+            };
+            if std::fs::read_to_string(&destino).ok().as_deref() != Some(text.as_str()) {
+                stale.push(destino);
+            }
         }
-        Ok(pendentes)
+        Ok(stale)
     }
 }
 
-// ---- watch -----------------------------------------------------------------
-
-fn instantaneo(raiz: &Path, destino: &Path) -> BTreeMap<PathBuf, Assinatura> {
-    let mut estado = BTreeMap::new();
-    for entrada in WalkDir::new(raiz.join(FONTE)).into_iter().filter_map(Result::ok) {
-        let caminho = entrada.path();
-        if !caminho.is_file() || caminho.extension().is_none_or(|e| e != "luau") {
+fn snapshot(root: &Path, targets: &[PathBuf]) -> BTreeMap<PathBuf, Signature> {
+    let mut state = BTreeMap::new();
+    for entry in WalkDir::new(root.join(SOURCE)).into_iter().filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_file() || path.extension().is_none_or(|e| e != "luau") {
             continue;
         }
-        if eh_gerado(caminho, destino) {
+        if is_generated(path, targets) {
             continue;
         }
-        if let Some(a) = Estado::assinatura(caminho) {
-            estado.insert(caminho.to_path_buf(), a);
+        if let Some(a) = State::signature(path) {
+            state.insert(path.to_path_buf(), a);
         }
     }
-    estado
+    state
 }
 
-fn observar(estado: &mut Estado, intervalo: Duration) -> Result<()> {
-    log(&format!("observando {}/ (Ctrl+C para parar)", FONTE));
-    let mut anterior = instantaneo(&estado.raiz, &estado.destino);
+fn watch_loop(state: &mut State, interval: Duration) -> Result<()> {
+    log(&format!("watching {}/ (Ctrl+C to stop)", SOURCE));
+    let mut previous = snapshot(&state.root, &state.paths());
 
     loop {
-        std::thread::sleep(intervalo);
-        let atual = instantaneo(&estado.raiz, &estado.destino);
-        if atual == anterior {
+        std::thread::sleep(interval);
+        let current = snapshot(&state.root, &state.paths());
+        if current == previous {
             continue;
         }
 
-        // Uniao das duas chaves, sem repetir: um caminho presente nos dois
-        // mapas sairia duas vezes no log.
-        let caminhos: std::collections::BTreeSet<&PathBuf> =
-            atual.keys().chain(anterior.keys()).collect();
-        for caminho in caminhos {
-            let a = anterior.get(caminho);
-            let b = atual.get(caminho);
+        let paths: std::collections::BTreeSet<&PathBuf> =
+            current.keys().chain(previous.keys()).collect();
+        for path in paths {
+            let a = previous.get(path);
+            let b = current.get(path);
             if a == b {
                 continue;
             }
-            let rotulo = match (a, b) {
-                (None, _) => "novo",
-                (_, None) => "apagado",
-                _ => "mudou",
+            let label = match (a, b) {
+                (None, _) => "is_new",
+                (_, None) => "deleted",
+                _ => "changed",
             };
-            log(&format!("{rotulo}: {}", estado.rel(caminho)));
+            log(&format!("{label}: {}", state.rel(path)));
         }
-        anterior = atual;
+        previous = current;
 
-        let inicio = Instant::now();
-        // Erro durante o watch nao derruba o loop: voce corrige e ele segue.
-        match estado.passada(false) {
-            Ok(_) => log(&format!("regerado em {} ms", inicio.elapsed().as_millis())),
-            Err(erro) => log(&format!("ERRO: {erro:#}")),
+        let started = Instant::now();
+        match state.pass(false) {
+            Ok(_) => log(&format!("regenerated in {} ms", started.elapsed().as_millis())),
+            Err(err) => log(&format!("ERROR: {err:#}")),
         }
     }
 }

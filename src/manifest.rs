@@ -1,118 +1,166 @@
-//! Escreve o Manifest a partir de todos os modulos do projeto.
-//!
-//! O Manifest e o unico arquivo que conhece todos os modulos ao mesmo tempo. E
-//! dele que o corpo de um modulo puxa o tipo esperado do `self`, e por isso
-//! `self` fica tipado sem voce anotar nada.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 
-use crate::extract::Modulo;
-use crate::rojo::Mapa;
+use crate::extract::Module;
+use crate::rojo::{Side, Map};
 
 pub const SELF_OF: &str = "src/Types/shared/SelfOf.luau";
-pub const DESTINO: &str = "src/Modux/shared/Manifest/init.luau";
-const SERVICO_RAIZ: &str = "ReplicatedStorage";
+pub const UTILS: &str = "src/Utils/Shared/init.luau";
 
-const ESPECIES: [(&str, &str); 3] = [
-    ("Controller", "AllControllers"),
-    ("Service", "AllServices"),
-    ("Component", "AllComponents"),
+pub const TARGETS: [(Side, &str); 2] = [
+    (Side::Client, "src/Modux/client/Manifest/init.luau"),
+    (Side::Server, "src/Modux/server/Manifest/init.luau"),
 ];
 
-pub fn destino(raiz: &Path) -> PathBuf {
-    raiz.join(DESTINO)
+fn buckets(side: Side) -> &'static [(&'static str, &'static str)] {
+    match side {
+        Side::Client => &[("Controller", "AllControllers"), ("Component", "AllComponents")],
+        Side::Server => &[("Service", "AllServices"), ("Component", "AllComponents")],
+        Side::Shared => &[],
+    }
 }
 
-pub fn emitir(modulos: &[Modulo], mapa: &Mapa) -> Result<String> {
-    let mut por_id: BTreeMap<&str, &Modulo> = BTreeMap::new();
-    for m in modulos {
-        if let Some(anterior) = por_id.insert(m.id.as_str(), m) {
-            bail!(
-                "ID duplicado {:?} em {} e {}",
-                m.id,
-                anterior.arquivo,
-                m.arquivo
-            );
+pub fn targets(root: &Path) -> Vec<(Side, PathBuf)> {
+    TARGETS.iter().map(|(l, p)| (*l, root.join(p))).collect()
+}
+
+pub fn validate(modules: &[Module], map: &Map) -> Result<BTreeMap<String, Side>> {
+    let mut by_id: BTreeMap<&str, &Module> = BTreeMap::new();
+    for m in modules {
+        if let Some(previous) = by_id.insert(m.id.as_str(), m) {
+            bail!("duplicate ID {:?} in {} and {}", m.id, previous.file, m.file);
         }
     }
 
-    // Dependencia para modulo que nao existe: falhar aqui, com a lista, antes
-    // de escrever qualquer coisa.
-    for m in modulos {
-        for dep in &m.dependencias {
-            if !por_id.contains_key(dep.as_str()) {
-                let disponiveis: Vec<&str> = por_id.keys().copied().collect();
+    let mut sides: BTreeMap<String, Side> = BTreeMap::new();
+    for m in modules {
+        sides.insert(m.id.clone(), map.side(Path::new(&m.file))?);
+    }
+
+    for m in modules {
+        let mine = sides[&m.id];
+        for dep in &m.dependencies {
+            let Some(target) = by_id.get(dep.as_str()) else {
+                let available: Vec<&str> = by_id.keys().copied().collect();
                 bail!(
-                    "[Manifest] {} pede {:?}, que nao existe. Disponiveis: {}",
-                    m.arquivo,
+                    "[Manifest] {} requires {:?}, which does not exist. Available: {}",
+                    m.file,
                     dep,
-                    disponiveis.join(", ")
+                    available.join(", ")
+                );
+            };
+            let theirs = sides[dep.as_str()];
+            if !mine.sees(theirs) {
+                bail!(
+                    "[Manifest] {} is {} and requires {:?}, which is {}.\n  \
+                     {} cannot see {} — move one of them, or go through the network.\n  \
+                     ({} is in {})",
+                    m.file,
+                    mine.name(),
+                    dep,
+                    theirs.name(),
+                    mine.name(),
+                    theirs.name(),
+                    dep,
+                    target.file
                 );
             }
         }
     }
 
-    let mut blocos = vec![String::from(
-        "--!strict\n\
-         -- GERADO por modux a partir das folhas do projeto.\n\
-         -- NAO EDITAR A MAO: a proxima geracao sobrescreve.\n\
-         --\n\
-         -- Cada entrada e o `self` ja enxertado: os membros da folha mais as\n\
-         -- `Dependencies` resolvidas. As dependencias apontam para a folha CRUA,\n\
-         -- nunca para a enxertada, senao o enxerto desce infinitamente.\n",
-    )];
+    Ok(sides)
+}
 
-    let mut requires = vec![format!(
-        "local {SERVICO_RAIZ} = game:GetService(\"{SERVICO_RAIZ}\")"
-    )];
-    requires.push(format!(
-        "local SelfOf = require({})",
-        mapa.caminho(Path::new(SELF_OF))?
-    ));
-    for (id, m) in &por_id {
-        let folha = Path::new(&m.arquivo)
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("Type.luau");
-        requires.push(format!("local {id} = require({})", mapa.caminho(&folha)?));
+pub fn emit(
+    side: Side,
+    modules: &[Module],
+    sides: &BTreeMap<String, Side>,
+    map: &Map,
+) -> Result<Option<String>> {
+    let visible: Vec<&Module> = modules
+        .iter()
+        .filter(|m| side.sees(sides[&m.id]))
+        .collect();
+
+    let own_side: Vec<&&Module> = visible.iter().filter(|m| sides[&m.id] == side).collect();
+    if own_side.is_empty() && visible.is_empty() {
+        return Ok(None);
     }
-    blocos.push(format!("{}\n", requires.join("\n")));
 
-    for (especie, alias) in ESPECIES {
-        let do_tipo: Vec<&&Modulo> = por_id
-            .values()
-            .filter(|m| m.especie == especie)
-            .collect();
+    let mut blocks = vec![format!(
+        "--!strict\n\
+         -- GENERATED by modux. DO NOT EDIT: the next generation overwrites this file.\n\
+         -- Manifest for the {} side.\n",
+        side.name()
+    )];
 
-        if do_tipo.is_empty() {
-            blocos.push(format!("export type {alias} = {{}}\n"));
+    let mut paths = vec![
+        ("SelfOf".to_string(), map.path(Path::new(SELF_OF))?),
+        ("Utils".to_string(), map.path(Path::new(UTILS))?),
+    ];
+    for m in &visible {
+        let leaf = crate::emit::leaf_path(Path::new(&m.file));
+        paths.push((m.id.clone(), map.path(&leaf)?));
+    }
+
+    let mut roots: Vec<String> = Vec::new();
+    for (_, path) in &paths {
+        let root = path.split('.').next().unwrap_or_default().to_string();
+        if !root.is_empty() && !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots.sort();
+
+    let mut requires: Vec<String> = roots
+        .iter()
+        .map(|r| format!("local {r} = game:GetService(\"{r}\")"))
+        .collect();
+    for (alias, path) in &paths {
+        requires.push(format!("local {alias} = require({path})"));
+    }
+    blocks.push(format!("{}\n", requires.join("\n")));
+
+    for (kind, alias) in buckets(side) {
+        let of_kind: Vec<&&Module> = visible.iter().filter(|m| m.kind == *kind).collect();
+        if of_kind.is_empty() {
+            blocks.push(format!("export type {alias} = {{}}\n"));
             continue;
         }
-
-        let mut corpo = vec![format!("export type {alias} = {{")];
-        for m in do_tipo {
-            let deps = if m.dependencias.is_empty() {
-                "{}".to_string()
-            } else {
-                let itens: Vec<String> = m
-                    .dependencias
-                    .iter()
-                    .map(|d| format!("{d}: {d}.Public"))
-                    .collect();
-                format!("{{ {} }}", itens.join(", "))
-            };
-            corpo.push(format!(
-                "\t{}: SelfOf.Build<{}.Public, {deps}>,",
-                m.id, m.id
-            ));
+        let mut body = vec![format!("export type {alias} = {{")];
+        for m in of_kind {
+            body.push(format!("\t{}: {},", m.id, entry(m)));
         }
-        corpo.push("}".to_string());
-        blocos.push(format!("{}\n", corpo.join("\n")));
+        body.push("}".to_string());
+        blocks.push(format!("{}\n", body.join("\n")));
     }
 
-    blocos.push("return {}\n".to_string());
-    Ok(blocos.join("\n"))
+    blocks.push("return {}\n".to_string());
+    Ok(Some(blocks.join("\n")))
+}
+
+fn entry(m: &Module) -> String {
+    let deps = if m.dependencies.is_empty() {
+        "{}".to_string()
+    } else {
+        let items: Vec<String> = m
+            .dependencies
+            .iter()
+            .map(|d| format!("{d}: {d}.Public"))
+            .collect();
+        format!("{{ {} }}", items.join(", "))
+    };
+
+    let mut extras = vec![
+        format!("Dependencies: {deps}"),
+        "Utils: Utils.Api".to_string(),
+    ];
+    if m.kind == "Component" {
+        extras.push("Instance: Instance".to_string());
+    }
+
+    format!("SelfOf.Build<{}.Public, {{ {} }}>", m.id, extras.join(", "))
 }

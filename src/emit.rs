@@ -1,72 +1,57 @@
-//! Escreve a folha de tipos (`Type.luau`) a partir do que o extrator achou.
-//!
-//! Transcricao pura: tudo aqui ja veio pronto do corpo. O emissor so decide o
-//! que INCLUIR e como reescrever os caminhos de require.
 
 use std::path::{Path, PathBuf};
 
-use crate::extract::Modulo;
+use crate::extract::Module;
 
-/// Caminho relativo sobe um nivel ao sair do `init.luau` para o `Type.luau`.
-///
-/// No corpo o `script` E a pasta do modulo; na folha o `script` e o proprio
-/// arquivo e `script.Parent` e a pasta. Sem reescrever, `script.Template`
-/// apontaria um nivel acima — e o Rojo monta sem reclamar, entao o erro so
-/// aparece em runtime.
-pub fn reescreve_require(expressao: &str) -> String {
-    if expressao == "script" || expressao.starts_with("script.") {
-        format!("script.Parent{}", &expressao["script".len()..])
+pub fn rewrite_require(expr: &str) -> String {
+    if expr == "script" || expr.starts_with("script.") {
+        format!("script.Parent{}", &expr["script".len()..])
     } else {
-        expressao.to_string()
+        expr.to_string()
     }
 }
 
-/// O identificador aparece como palavra inteira em algum dos textos?
-///
-/// Comparacao manual em vez de regex: e a unica coisa que pediria a dependencia,
-/// e as bordas de palavra aqui sao simples (alfanumerico ou `_`).
-fn cita(textos: &[String], nome: &str) -> bool {
-    textos.iter().any(|t| contem_palavra(t, nome))
+fn cites(texts: &[String], name: &str) -> bool {
+    texts.iter().any(|t| has_word(t, name))
 }
 
-fn contem_palavra(texto: &str, nome: &str) -> bool {
-    if nome.is_empty() {
+fn has_word(text: &str, name: &str) -> bool {
+    if name.is_empty() {
         return false;
     }
-    let bytes = texto.as_bytes();
-    let alvo = nome.as_bytes();
-    let parte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let bytes = text.as_bytes();
+    let target = name.as_bytes();
+    let is_word_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
 
     let mut i = 0;
-    while let Some(pos) = texto[i..].find(nome) {
-        let ini = i + pos;
-        let fim = ini + alvo.len();
-        let antes_ok = ini == 0 || !parte(bytes[ini - 1]);
-        let depois_ok = fim >= bytes.len() || !parte(bytes[fim]);
-        if antes_ok && depois_ok {
+    while let Some(pos) = text[i..].find(name) {
+        let start_at = i + pos;
+        let end_at = start_at + target.len();
+        let before_ok = start_at == 0 || !is_word_byte(bytes[start_at - 1]);
+        let after_ok = end_at >= bytes.len() || !is_word_byte(bytes[end_at]);
+        if before_ok && after_ok {
             return true;
         }
-        i = ini + 1;
-        if i >= texto.len() {
+        i = start_at + 1;
+        if i >= text.len() {
             break;
         }
     }
     false
 }
 
-/// O alias aparece como prefixo de tipo (`Alias.Algo`)?
-fn cita_alias(textos: &[String], alias: &str) -> bool {
-    textos.iter().any(|t| {
+fn cites_alias(texts: &[String], alias: &str) -> bool {
+    texts.iter().any(|t| {
         let mut i = 0;
         while let Some(pos) = t[i..].find(alias) {
-            let ini = i + pos;
-            let fim = ini + alias.len();
-            let antes_ok = ini == 0 || !t.as_bytes()[ini - 1].is_ascii_alphanumeric();
-            let depois = t[fim..].trim_start();
-            if antes_ok && depois.starts_with('.') {
+            let start_at = i + pos;
+            let end_at = start_at + alias.len();
+            let before_ok = start_at == 0 || !t.as_bytes()[start_at - 1].is_ascii_alphanumeric();
+            let after = t[end_at..].trim_start();
+            if before_ok && after.starts_with('.') {
                 return true;
             }
-            i = ini + 1;
+            i = start_at + 1;
             if i >= t.len() {
                 break;
             }
@@ -75,91 +60,81 @@ fn cita_alias(textos: &[String], alias: &str) -> bool {
     })
 }
 
-pub fn caminho_da_folha(origem: &Path) -> PathBuf {
-    origem.parent().unwrap_or(Path::new(".")).join("Type.luau")
+pub fn leaf_path(origin: &Path) -> PathBuf {
+    origin.parent().unwrap_or(Path::new(".")).join("Type.luau")
 }
 
-pub fn emitir(m: &Modulo) -> String {
-    let mut membros: Vec<(String, String)> = m
-        .campos
+pub fn emit(m: &Module) -> String {
+    let mut members: Vec<(String, String)> = m
+        .fields
         .iter()
-        .map(|c| (c.nome.clone(), c.tipo.clone()))
+        .map(|c| (c.name.clone(), c.ty.clone()))
         .collect();
-    membros.extend(m.metodos.iter().map(|x| (x.nome.clone(), x.assinatura.clone())));
-    let textos: Vec<String> = membros.iter().map(|(_, t)| t.clone()).collect();
+    members.extend(m.methods.iter().map(|x| (x.name.clone(), x.signature.clone())));
+    let texts: Vec<String> = members.iter().map(|(_, t)| t.clone()).collect();
 
-    // So entra o require que algum tipo emitido realmente usa. Isso exclui o
-    // `Classes` sem regra especial — e precisa excluir: se ele entrasse, a folha
-    // requereria o modulo que requer o Manifest que requer a folha.
-    let requires: Vec<_> = m.requires.iter().filter(|r| cita_alias(&textos, &r.alias)).collect();
+    let requires: Vec<_> = m.requires.iter().filter(|r| cites_alias(&texts, &r.alias)).collect();
 
-    // Tipo local so entra se algum membro citar, e ele pode citar outro tipo
-    // local, entao a varredura repete ate estabilizar.
-    let mut locais = Vec::new();
-    let mut pendentes: Vec<_> = m.tipos_locais.iter().collect();
-    let mut alvo = textos.clone();
+    let mut locals = Vec::new();
+    let mut stale: Vec<_> = m.local_types.iter().collect();
+    let mut target = texts.clone();
     loop {
-        let antes = locais.len();
-        let mut restantes = Vec::new();
-        for tl in pendentes {
-            if cita(&alvo, &tl.nome) {
-                alvo.push(tl.texto.clone());
-                locais.push(tl);
+        let before = locals.len();
+        let mut rest = Vec::new();
+        for tl in stale {
+            if cites(&target, &tl.name) {
+                target.push(tl.text.clone());
+                locals.push(tl);
             } else {
-                restantes.push(tl);
+                rest.push(tl);
             }
         }
-        pendentes = restantes;
-        if locais.len() == antes {
+        stale = rest;
+        if locals.len() == before {
             break;
         }
     }
 
-    // Servico so entra se algum require herdado comecar por ele.
-    let exprs: Vec<String> = requires.iter().map(|r| reescreve_require(&r.expressao)).collect();
-    let servicos: Vec<_> = m
-        .servicos
+    let exprs: Vec<String> = requires.iter().map(|r| rewrite_require(&r.expr)).collect();
+    let services: Vec<_> = m
+        .services
         .iter()
         .filter(|s| exprs.iter().any(|e| e.starts_with(&format!("{}.", s.alias))))
         .collect();
 
-    let mut blocos = vec![format!(
+    let mut blocks = vec![format!(
         "--!strict\n\
-         -- GERADO por modux a partir de {}\n\
-         -- NAO EDITAR A MAO: a proxima geracao sobrescreve.\n",
-        m.arquivo
+         -- GENERATED by modux from {}\n\
+         -- DO NOT EDIT: the next generation overwrites this file.\n",
+        m.file
     )];
 
-    let mut cabecalho = Vec::new();
-    for s in &servicos {
-        cabecalho.push(format!(
+    let mut header = Vec::new();
+    for s in &services {
+        header.push(format!(
             "local {} = game:GetService(\"{}\")",
-            s.alias, s.servico
+            s.alias, s.service
         ));
     }
-    for r in &requires {
-        cabecalho.push(format!(
-            "local {} = require({})",
-            r.alias,
-            reescreve_require(&r.expressao)
-        ));
+    for (i, r) in requires.iter().enumerate() {
+        header.push(format!("local {} = require({})", r.alias, exprs[i]));
     }
-    if !cabecalho.is_empty() {
-        blocos.push(format!("{}\n", cabecalho.join("\n")));
+    if !header.is_empty() {
+        blocks.push(format!("{}\n", header.join("\n")));
     }
 
-    if !locais.is_empty() {
-        let copiados: Vec<&str> = locais.iter().map(|t| t.texto.as_str()).collect();
-        blocos.push(format!("{}\n", copiados.join("\n")));
+    if !locals.is_empty() {
+        let copied: Vec<&str> = locals.iter().map(|t| t.text.as_str()).collect();
+        blocks.push(format!("{}\n", copied.join("\n")));
     }
 
-    let mut corpo = vec!["export type Public = {".to_string()];
-    for (nome, tipo) in &membros {
-        corpo.push(format!("\t{nome}: {tipo},"));
+    let mut body = vec!["export type Public = {".to_string()];
+    for (name, ty) in &members {
+        body.push(format!("\t{name}: {ty},"));
     }
-    corpo.push("}".to_string());
-    blocos.push(format!("{}\n", corpo.join("\n")));
+    body.push("}".to_string());
+    blocks.push(format!("{}\n", body.join("\n")));
 
-    blocos.push("return {}\n".to_string());
-    blocos.join("\n")
+    blocks.push("return {}\n".to_string());
+    blocks.join("\n")
 }

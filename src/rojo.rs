@@ -1,8 +1,3 @@
-//! Traduz caminho no disco para caminho no DataModel, lendo o projeto Rojo.
-//!
-//! Nada aqui e hardcoded: se voce mexer no `default.project.json`, o Manifest
-//! acompanha. Arquivo fora do mapeamento falha alto, em vez de virar um caminho
-//! errado que so quebra em runtime.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -10,73 +5,108 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
-pub struct Mapa {
-    /// prefixo no disco -> trilha no DataModel
-    entradas: BTreeMap<String, Vec<String>>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Side {
+    Client,
+    Server,
+    Shared,
 }
 
-impl Mapa {
-    pub fn ler(projeto: &Path) -> Result<Self> {
-        let texto = std::fs::read_to_string(projeto)
-            .with_context(|| format!("nao achei {}", projeto.display()))?;
-        let json: Value = serde_json::from_str(&texto)
-            .with_context(|| format!("{} nao e JSON valido", projeto.display()))?;
-        let arvore = json
-            .get("tree")
-            .with_context(|| format!("{} nao tem `tree`", projeto.display()))?;
+impl Side {
+    pub fn name(self) -> &'static str {
+        match self {
+            Side::Client => "client",
+            Side::Server => "server",
+            Side::Shared => "shared",
+        }
+    }
 
-        let mut entradas = BTreeMap::new();
-        if let Value::Object(mapa) = arvore {
-            for (chave, filho) in mapa {
-                if !chave.starts_with('$') {
-                    desce(filho, &[chave.clone()], &mut entradas);
+    pub fn sees(self, other: Side) -> bool {
+        match (self, other) {
+            (_, Side::Shared) => true,
+            (Side::Shared, _) => false,
+            (a, b) => a == b,
+        }
+    }
+}
+
+const SERVER_ONLY: [&str; 2] = ["ServerScriptService", "ServerStorage"];
+const CLIENT_ONLY: [&str; 4] = ["StarterPlayer", "StarterGui", "StarterPack", "ReplicatedFirst"];
+
+pub struct Map {
+    entries: BTreeMap<String, Vec<String>>,
+}
+
+impl Map {
+    pub fn read(project: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(project)
+            .with_context(|| format!("{} not found", project.display()))?;
+        let json: Value = serde_json::from_str(&text)
+            .with_context(|| format!("{} is not valid JSON", project.display()))?;
+        let tree = json
+            .get("tree")
+            .with_context(|| format!("{} has no `tree`", project.display()))?;
+
+        let mut entries = BTreeMap::new();
+        if let Value::Object(map) = tree {
+            for (key, child) in map {
+                if !key.starts_with('$') {
+                    descend(child, &[key.clone()], &mut entries);
                 }
             }
         }
-        Ok(Self { entradas })
+        Ok(Self { entries })
     }
 
-    /// `src/Entity/shared/Zombie/Type.luau` -> `...Entity.Zombie.Type`
-    pub fn caminho(&self, arquivo: &Path) -> Result<String> {
-        let rel = arquivo.to_string_lossy().replace('\\', "/");
+    pub fn path(&self, file: &Path) -> Result<String> {
+        let rel = file.to_string_lossy().replace('\\', "/");
 
-        // O prefixo mais longo ganha, senao `src/Modux/shared` perderia para um
-        // mapeamento mais raso.
-        let mut chaves: Vec<&String> = self.entradas.keys().collect();
-        chaves.sort_by_key(|k| std::cmp::Reverse(k.len()));
+        let mut keys: Vec<&String> = self.entries.keys().collect();
+        keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
 
-        for disco in chaves {
-            if rel != *disco && !rel.starts_with(&format!("{disco}/")) {
+        for disk in keys {
+            if rel != *disk && !rel.starts_with(&format!("{disk}/")) {
                 continue;
             }
-            let resto = rel[disco.len()..].trim_matches('/');
-            let mut partes: Vec<String> =
-                resto.split('/').filter(|p| !p.is_empty()).map(str::to_string).collect();
+            let remainder = rel[disk.len()..].trim_matches('/');
+            let mut parts: Vec<String> =
+                remainder.split('/').filter(|p| !p.is_empty()).map(str::to_string).collect();
 
-            if let Some(ultima) = partes.last().cloned() {
-                if let Some(nome) = ultima.strip_suffix(".luau") {
-                    partes.pop();
-                    // `init.luau` vira a propria pasta, igual o Rojo resolve
-                    if nome != "init" {
-                        partes.push(nome.to_string());
+            if let Some(last) = parts.last().cloned() {
+                if let Some(name) = last.strip_suffix(".luau") {
+                    parts.pop();
+                    if name != "init" {
+                        parts.push(name.to_string());
                     }
                 }
             }
 
-            let mut trilha = self.entradas[disco].clone();
-            trilha.extend(partes);
-            return Ok(trilha.join("."));
+            let mut trail = self.entries[disk].clone();
+            trail.extend(parts);
+            return Ok(trail.join("."));
         }
 
-        bail!("caminho fora do default.project.json: {rel}")
+        bail!("path outside default.project.json: {rel}")
+    }
+
+    pub fn side(&self, file: &Path) -> Result<Side> {
+        let path = self.path(file)?;
+        let root = path.split('.').next().unwrap_or_default();
+        Ok(if SERVER_ONLY.contains(&root) {
+            Side::Server
+        } else if CLIENT_ONLY.contains(&root) {
+            Side::Client
+        } else {
+            Side::Shared
+        })
     }
 }
 
-fn desce(no: &Value, trilha: &[String], saida: &mut BTreeMap<String, Vec<String>>) {
-    let Value::Object(mapa) = no else { return };
+fn descend(node: &Value, trail: &[String], out: &mut BTreeMap<String, Vec<String>>) {
+    let Value::Object(map) = node else { return };
 
-    if let Some(caminho) = mapa.get("$path") {
-        let texto = match caminho {
+    if let Some(path) = map.get("$path") {
+        let text = match path {
             Value::String(s) => Some(s.clone()),
             Value::Object(o) => o
                 .get("optional")
@@ -85,17 +115,17 @@ fn desce(no: &Value, trilha: &[String], saida: &mut BTreeMap<String, Vec<String>
                 .map(str::to_string),
             _ => None,
         };
-        if let Some(t) = texto {
-            saida.insert(t.replace('\\', "/").trim_end_matches('/').to_string(), trilha.to_vec());
+        if let Some(t) = text {
+            out.insert(t.replace('\\', "/").trim_end_matches('/').to_string(), trail.to_vec());
         }
     }
 
-    for (chave, filho) in mapa {
-        if chave.starts_with('$') {
+    for (key, child) in map {
+        if key.starts_with('$') {
             continue;
         }
-        let mut abaixo = trilha.to_vec();
-        abaixo.push(chave.clone());
-        desce(filho, &abaixo, saida);
+        let mut below = trail.to_vec();
+        below.push(key.clone());
+        descend(child, &below, out);
     }
 }

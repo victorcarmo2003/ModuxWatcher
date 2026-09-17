@@ -1,8 +1,3 @@
-//! Roda o `luau-ast` e da acesso ao JSON dele.
-//!
-//! A arvore nao e desserializada em structs: os nos tem forma variavel demais e
-//! so uma fracao dos campos interessa. `serde_json::Value` com acessores curtos
-//! sai mais barato de manter do que acompanhar a gramatica inteira.
 
 use std::path::Path;
 use std::process::Command;
@@ -10,132 +5,117 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
-/// Nome do binario procurado no PATH. O Rokit instala ele junto quando o
-/// projeto declara `luau-lang/luau` no rokit.toml.
 pub const BIN: &str = "luau-ast";
 
-/// Texto do arquivo, fatiavel por `location`.
-///
-/// Os tipos sao recuperados fatiando o FONTE ORIGINAL em vez de reimprimir a
-/// partir da arvore. Assim `Template.Data`, `FSM.FSM<Estado>` e
-/// `(boolean, string)` saem exatamente como foram digitados, e nao existe um
-/// impressor de tipos para manter em dia com a gramatica.
-pub struct Fonte {
-    linhas: Vec<String>,
+pub struct Source {
+    lines: Vec<String>,
 }
 
-impl Fonte {
-    pub fn nova(texto: &str) -> Self {
+impl Source {
+    pub fn new(text: &str) -> Self {
         Self {
-            linhas: texto.replace("\r\n", "\n").split('\n').map(str::to_string).collect(),
+            lines: text.replace("\r\n", "\n").split('\n').map(str::to_string).collect(),
         }
     }
 
-    fn ponto(s: &str) -> (usize, usize) {
-        let mut partes = s.trim().split(',');
-        let linha = partes.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-        let coluna = partes.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-        (linha, coluna)
+    fn point(s: &str) -> (usize, usize) {
+        let mut parts = s.trim().split(',');
+        let line = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let column = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        (line, column)
     }
 
-    /// `location` vem como `"6,27 - 6,31"`, com linha e coluna base zero.
-    pub fn fatia(&self, location: &str) -> String {
-        let mut lados = location.split('-');
-        let (l0, c0) = Self::ponto(lados.next().unwrap_or("0,0"));
-        let (l1, c1) = Self::ponto(lados.next().unwrap_or("0,0"));
+    pub fn slice(&self, location: &str) -> String {
+        let mut sides = location.split('-');
+        let (l0, c0) = Self::point(sides.next().unwrap_or("0,0"));
+        let (l1, c1) = Self::point(sides.next().unwrap_or("0,0"));
 
-        let pegar = |i: usize| self.linhas.get(i).map(String::as_str).unwrap_or("");
-        let corte = |s: &str, ini: usize, fim: usize| -> String {
+        let line_at = |i: usize| self.lines.get(i).map(String::as_str).unwrap_or("");
+        let cut = |s: &str, start_at: usize, end_at: usize| -> String {
             let chars: Vec<char> = s.chars().collect();
-            let ini = ini.min(chars.len());
-            let fim = fim.min(chars.len());
-            chars[ini..fim].iter().collect()
+            let start_at = start_at.min(chars.len());
+            let end_at = end_at.min(chars.len());
+            chars[start_at..end_at].iter().collect()
         };
 
         if l0 == l1 {
-            return corte(pegar(l0), c0, c1);
+            return cut(line_at(l0), c0, c1);
         }
-        let mut partes = vec![corte(pegar(l0), c0, usize::MAX)];
+        let mut parts = vec![cut(line_at(l0), c0, usize::MAX)];
         for i in (l0 + 1)..l1 {
-            partes.push(pegar(i).to_string());
+            parts.push(line_at(i).to_string());
         }
-        partes.push(corte(pegar(l1), 0, c1));
-        partes.join("\n")
+        parts.push(cut(line_at(l1), 0, c1));
+        parts.join("\n")
     }
 }
 
-/// Executa o `luau-ast` e devolve a raiz (`root.body`) junto com o fonte.
-pub fn analisar(caminho: &Path) -> Result<(Vec<Value>, Fonte)> {
-    let texto = std::fs::read_to_string(caminho)
-        .with_context(|| format!("nao consegui ler {}", caminho.display()))?;
+pub fn parse(path: &Path) -> Result<(Vec<Value>, Source)> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("could not read {}", path.display()))?;
 
-    let saida = Command::new(BIN).arg(caminho).output().with_context(|| {
+    let out = Command::new(BIN).arg(path).output().with_context(|| {
         format!(
-            "nao encontrei `{BIN}` no PATH.\n\
-             Instale com:  rokit add luau-lang/luau\n\
-             (o mesmo pacote traz o luau-analyze, que voce vai querer de qualquer jeito)"
+            "`{BIN}` not found in PATH.\n\
+             Install with:  rokit add luau-lang/luau\n\
+             (the same package ships luau-analyze, which you will want anyway)"
         )
     })?;
 
-    if !saida.status.success() {
+    if !out.status.success() {
         bail!(
             "{BIN} falhou em {}:\n{}",
-            caminho.display(),
-            String::from_utf8_lossy(&saida.stderr).trim()
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
         );
     }
 
-    let json: Value = serde_json::from_slice(&saida.stdout)
-        .with_context(|| format!("saida do {BIN} nao e JSON valido para {}", caminho.display()))?;
+    let json: Value = serde_json::from_slice(&out.stdout)
+        .with_context(|| format!("{BIN} output is not valid JSON for {}", path.display()))?;
 
-    let corpo = json
+    let body = json
         .get("root")
         .and_then(|r| r.get("body"))
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
 
-    Ok((corpo, Fonte::nova(&texto)))
+    Ok((body, Source::new(&text)))
 }
 
-// ---- acessores curtos, para o resto do codigo nao virar sopa de `.get()` ----
-
-pub fn tipo(no: &Value) -> &str {
-    no.get("type").and_then(Value::as_str).unwrap_or("")
+pub fn kind_of(node: &Value) -> &str {
+    node.get("type").and_then(Value::as_str).unwrap_or("")
 }
 
-pub fn texto<'a>(no: &'a Value, chave: &str) -> &'a str {
-    no.get(chave).and_then(Value::as_str).unwrap_or("")
+pub fn text<'a>(node: &'a Value, key: &str) -> &'a str {
+    node.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
-pub fn lista<'a>(no: &'a Value, chave: &str) -> &'a [Value] {
-    no.get(chave).and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[])
+pub fn list<'a>(node: &'a Value, key: &str) -> &'a [Value] {
+    node.get(key).and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[])
 }
 
-/// Verdadeiro se o no for `AstExprLocal` apontando para o local `nome`.
-pub fn eh_local(no: &Value, nome: &str) -> bool {
-    tipo(no) == "AstExprLocal" && no.get("local").map(|l| texto(l, "name")) == Some(nome)
+pub fn is_local(node: &Value, name: &str) -> bool {
+    kind_of(node) == "AstExprLocal" && node.get("local").map(|l| text(l, "name")) == Some(name)
 }
 
-/// Verdadeiro se o no for `<algo>.<nome>`.
-pub fn indexa(no: &Value, nome: &str) -> bool {
-    tipo(no) == "AstExprIndexName" && texto(no, "index") == nome
+pub fn indexes(node: &Value, name: &str) -> bool {
+    kind_of(node) == "AstExprIndexName" && text(node, "index") == name
 }
 
-/// Percorre a arvore inteira chamando `visita` em cada no que tenha `type`.
-pub fn caminha(no: &Value, visita: &mut dyn FnMut(&Value)) {
-    match no {
-        Value::Object(mapa) => {
-            if mapa.contains_key("type") {
-                visita(no);
+pub fn walk(node: &Value, visit: &mut dyn FnMut(&Value)) {
+    match node {
+        Value::Object(map) => {
+            if map.contains_key("type") {
+                visit(node);
             }
-            for v in mapa.values() {
-                caminha(v, visita);
+            for v in map.values() {
+                walk(v, visit);
             }
         }
-        Value::Array(itens) => {
-            for v in itens {
-                caminha(v, visita);
+        Value::Array(items) => {
+            for v in items {
+                walk(v, visit);
             }
         }
         _ => {}
