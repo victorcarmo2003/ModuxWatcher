@@ -3,6 +3,41 @@ use std::path::{Path, PathBuf};
 
 use crate::extract::Module;
 
+/// A type annotation is transcribed from the source verbatim, so a multi-line
+/// one arrives carrying whatever indentation it had where it was written. An
+/// annotation nested inside an `if` inside a `while` would land four tabs deep
+/// in a leaf that only has one level. Valid Luau either way, but the leaf is a
+/// file people read on hover, so strip the original indentation and lay it out
+/// against `at`.
+fn reindent(text: &str, at: &str) -> String {
+    let mut lines = text.lines();
+    let Some(first) = lines.next() else {
+        return text.to_string();
+    };
+    let rest: Vec<&str> = lines.collect();
+    if rest.is_empty() {
+        return first.to_string();
+    }
+
+    let common = rest
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+
+    let mut out = String::from(first);
+    for line in rest {
+        out.push('\n');
+        if line.trim().is_empty() {
+            continue;
+        }
+        out.push_str(at);
+        out.push_str(&line[common.min(line.len())..]);
+    }
+    out
+}
+
 pub fn rewrite_require(expr: &str) -> String {
     if expr == "script" || expr.starts_with("script.") {
         format!("script.Parent{}", &expr["script".len()..])
@@ -130,7 +165,7 @@ pub fn emit(m: &Module) -> String {
 
     let mut body = vec!["export type Public = {".to_string()];
     for (name, ty) in &members {
-        body.push(format!("\t{name}: {ty},"));
+        body.push(format!("\t{name}: {},", reindent(ty, "\t")));
     }
     body.push("}".to_string());
     blocks.push(format!("{}\n", body.join("\n")));
