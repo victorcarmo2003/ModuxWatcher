@@ -7,8 +7,6 @@ use anyhow::{bail, Result};
 use crate::extract::Module;
 use crate::rojo::{Side, Map};
 
-pub const SELF_OF: &str = "src/Types/shared/SelfOf.luau";
-pub const UTILS: &str = "src/Utils/Shared/init.luau";
 
 pub const TARGETS: [(Side, &str); 2] = [
     (Side::Client, "src/Modux/client/Manifest/init.luau"),

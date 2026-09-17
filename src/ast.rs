@@ -57,8 +57,10 @@ pub fn parse(path: &Path) -> Result<(Vec<Value>, Source)> {
     let out = Command::new(BIN).arg(path).output().with_context(|| {
         format!(
             "`{BIN}` not found in PATH.\n\
-             Install with:  rokit add luau-lang/luau\n\
-             (the same package ships luau-analyze, which you will want anyway)"
+             It ships inside the luau-lang/luau release archive (luau-windows.zip,\n\
+             luau-ubuntu.zip, luau-macos.zip), next to luau-analyze. `rokit add\n\
+             luau-lang/luau` does NOT provide it: rokit keeps one binary per tool\n\
+             and that one is `luau`. Download the archive and put luau-ast on PATH."
         )
     })?;
 

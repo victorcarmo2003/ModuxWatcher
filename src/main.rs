@@ -25,9 +25,12 @@ const DEFAULT_INTERVAL_MS: u64 = 400;
     name = "modux",
     version,
     about = "Type generator for the Modux Roblox framework",
-    long_about = "Le os modules do project com o luau-ast e escreve as folhas de \
-                  kind_of (Type.luau) e o Manifest.\n\n\
-                  Precisa do `luau-ast` node PATH:  rokit add luau-lang/luau"
+    long_about = "Reads the project modules with luau-ast and writes the per-module \
+                  type leaves (Type.luau) and the Manifest.\n\n\
+                  Needs `luau-ast` on PATH. It ships inside the luau-lang/luau release \
+                  archive (luau-windows.zip, luau-ubuntu.zip, luau-macos.zip), next to \
+                  luau-analyze. `rokit add luau-lang/luau` does NOT provide it: rokit \
+                  keeps one binary per tool and that one is `luau`."
 )]
 struct Cli {
     #[arg(long, short, global = true, value_name = "PATH")]
@@ -39,18 +42,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Write the type leaves and the Manifest once, then exit.
     Generate,
 
+    /// Regenerate on every source change until interrupted.
     Watch {
+        /// Milliseconds between filesystem polls.
         #[arg(long, default_value_t = DEFAULT_INTERVAL_MS)]
         interval: u64,
     },
 
+    /// Fail if anything on disk differs from what Generate would write.
     Check,
 
+    /// Print every module found, with its id, kind and side.
     List,
 
+    /// Dump the extracted shape of one module as JSON, for debugging.
     Extract {
+        /// Module to inspect.
         file: PathBuf,
     },
 }
@@ -66,16 +76,16 @@ fn main() {
 fn run(cli: &Cli) -> Result<()> {
     match &cli.command {
         Command::Extract { file } => {
-            let dados = Extractor::new(file)?.run()?;
-            println!("{}", serde_json::to_string_pretty(&dados)?);
+            let data = Extractor::new(file)?.run()?;
+            println!("{}", serde_json::to_string_pretty(&data)?);
             Ok(())
         }
         Command::Generate => {
             let root = project_root(cli)?;
-            let mut state = State::is_new(&root)?;
+            let mut state = State::new(&root)?;
             let started = Instant::now();
-            let mudou = state.pass(true)?;
-            if !mudou {
+            let changed = state.pass(true)?;
+            if !changed {
                 log("up to date");
             }
             log(&format!("{} ms", started.elapsed().as_millis()));
@@ -83,7 +93,7 @@ fn run(cli: &Cli) -> Result<()> {
         }
         Command::Check => {
             let root = project_root(cli)?;
-            let mut state = State::is_new(&root)?;
+            let mut state = State::new(&root)?;
             let stale = state.check_stale()?;
             if stale.is_empty() {
                 log("up to date");
@@ -99,7 +109,7 @@ fn run(cli: &Cli) -> Result<()> {
         }
         Command::List => {
             let root = project_root(cli)?;
-            let mut state = State::is_new(&root)?;
+            let mut state = State::new(&root)?;
             for m in state.modules()? {
                 let deps = if m.dependencies.is_empty() {
                     "-".to_string()
@@ -112,7 +122,7 @@ fn run(cli: &Cli) -> Result<()> {
         }
         Command::Watch { interval } => {
             let root = project_root(cli)?;
-            let mut state = State::is_new(&root)?;
+            let mut state = State::new(&root)?;
             let started = Instant::now();
             if !state.pass(true)? {
                 log("up to date");
@@ -204,7 +214,7 @@ struct State {
 }
 
 impl State {
-    fn is_new(root: &Path) -> Result<Self> {
+    fn new(root: &Path) -> Result<Self> {
         Ok(Self {
             root: root.to_path_buf(),
             map: Map::read(&root.join(PROJECT))?,
@@ -228,18 +238,18 @@ impl State {
     }
 
     fn extract(&mut self, path: &Path) -> Result<(Module, bool)> {
-        let assin = Self::signature(path);
-        if let (Some(a), Some((previous, dados))) = (assin, self.cache.get(path)) {
+        let signature = Self::signature(path);
+        if let (Some(a), Some((previous, data))) = (signature, self.cache.get(path)) {
             if *previous == a {
-                return Ok((dados.clone(), false));
+                return Ok((data.clone(), false));
             }
         }
-        let mut dados = Extractor::new(path)?.run()?;
-        dados.file = self.rel(path);
-        if let Some(a) = assin {
-            self.cache.insert(path.to_path_buf(), (a, dados.clone()));
+        let mut data = Extractor::new(path)?.run()?;
+        data.file = self.rel(path);
+        if let Some(a) = signature {
+            self.cache.insert(path.to_path_buf(), (a, data.clone()));
         }
-        Ok((dados, true))
+        Ok((data, true))
     }
 
     fn modules(&mut self) -> Result<Vec<Module>> {
@@ -265,29 +275,29 @@ impl State {
         Ok(true)
     }
 
-    fn pass(&mut self, verboso: bool) -> Result<bool> {
+    fn pass(&mut self, verbose: bool) -> Result<bool> {
         let targets_list = find_modules(&self.root, &self.paths());
         let seen: Vec<PathBuf> = targets_list.clone();
         self.cache.retain(|k, _| seen.contains(k));
 
         let mut modules = Vec::new();
-        let mut mudou = false;
+        let mut changed = false;
         let mut pending_leaves: Vec<(PathBuf, Module)> = Vec::new();
 
         for target in &targets_list {
-            let (dados, is_new) = self.extract(target)?;
-            if is_new || verboso {
-                for p in &dados.issues {
+            let (data, is_new) = self.extract(target)?;
+            if is_new || verbose {
+                for p in &data.issues {
                     eprintln!(
                         "[modux] {}:{}:{} {}",
-                        dados.file, p.line, p.column, p.message
+                        data.file, p.line, p.column, p.message
                     );
                 }
             }
             if is_new {
-                pending_leaves.push((target.clone(), dados.clone()));
+                pending_leaves.push((target.clone(), data.clone()));
             }
-            modules.push(dados);
+            modules.push(data);
         }
 
         if modules.is_empty() {
@@ -296,11 +306,11 @@ impl State {
 
         let sides = manifest::validate(&modules, &self.map)?;
 
-        for (target, dados) in &pending_leaves {
+        for (target, data) in &pending_leaves {
             let leaf = emit::leaf_path(target);
-            if Self::write_if_changed(&leaf, &emit::emit(dados))? {
+            if Self::write_if_changed(&leaf, &emit::emit(data))? {
                 log(&format!("leaf: {}", self.rel(&leaf)));
-                mudou = true;
+                changed = true;
             }
         }
 
@@ -311,7 +321,7 @@ impl State {
             if Self::write_if_changed(&destino, &text)? {
                 let n = modules.iter().filter(|m| side.sees(sides[&m.id])).count();
                 log(&format!("manifest {}: {} ({n} modules)", side.name(), self.rel(&destino)));
-                mudou = true;
+                changed = true;
             }
         }
 
@@ -321,11 +331,11 @@ impl State {
             };
             if Self::write_if_changed(&destino, &text)? {
                 log(&format!("modules {}: {}", side.name(), self.rel(&destino)));
-                mudou = true;
+                changed = true;
             }
         }
 
-        Ok(mudou)
+        Ok(changed)
     }
 
     fn paths(&self) -> Vec<PathBuf> {
@@ -407,7 +417,7 @@ fn watch_loop(state: &mut State, interval: Duration) -> Result<()> {
                 continue;
             }
             let label = match (a, b) {
-                (None, _) => "is_new",
+                (None, _) => "new",
                 (_, None) => "deleted",
                 _ => "changed",
             };
