@@ -199,6 +199,7 @@ struct State {
     root: PathBuf,
     map: Map,
     targets: Vec<(crate::rojo::Side, PathBuf)>,
+    module_lists: Vec<(crate::rojo::Side, PathBuf)>,
     cache: BTreeMap<PathBuf, (Signature, Module)>,
 }
 
@@ -208,6 +209,7 @@ impl State {
             root: root.to_path_buf(),
             map: Map::read(&root.join(PROJECT))?,
             targets: manifest::targets(root),
+            module_lists: manifest::module_lists(root),
             cache: BTreeMap::new(),
         })
     }
@@ -313,11 +315,23 @@ impl State {
             }
         }
 
+        for (side, destino) in self.module_lists.clone() {
+            let Some(text) = manifest::emit_module_list(side, &modules, &sides, &self.map)? else {
+                continue;
+            };
+            if Self::write_if_changed(&destino, &text)? {
+                log(&format!("modules {}: {}", side.name(), self.rel(&destino)));
+                mudou = true;
+            }
+        }
+
         Ok(mudou)
     }
 
     fn paths(&self) -> Vec<PathBuf> {
-        self.targets.iter().map(|(_, p)| p.clone()).collect()
+        let mut all: Vec<PathBuf> = self.targets.iter().map(|(_, p)| p.clone()).collect();
+        all.extend(self.module_lists.iter().map(|(_, p)| p.clone()));
+        all
     }
 
     fn check_stale(&mut self) -> Result<Vec<PathBuf>> {
@@ -338,6 +352,14 @@ impl State {
         }
         for (side, destino) in self.targets.clone() {
             let Some(text) = manifest::emit(side, &modules, &sides, &self.map)? else {
+                continue;
+            };
+            if std::fs::read_to_string(&destino).ok().as_deref() != Some(text.as_str()) {
+                stale.push(destino);
+            }
+        }
+        for (side, destino) in self.module_lists.clone() {
+            let Some(text) = manifest::emit_module_list(side, &modules, &sides, &self.map)? else {
                 continue;
             };
             if std::fs::read_to_string(&destino).ok().as_deref() != Some(text.as_str()) {
