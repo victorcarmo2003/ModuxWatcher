@@ -90,9 +90,24 @@ jobs:
           path: assets
           merge-multiple: true
 
+      # Sobe os assets em serie, com o gh. A action-gh-release@v2 sobe os cinco
+      # em paralelo e na v0.2.0 morreu com "Error creating asset temp dir" no
+      # meio do upload, apagando o release que ela mesma tinha acabado de criar.
+      # O release e a parte que nao pode falhar pela metade: se faltar asset, o
+      # Rokit nao acha binario compativel e a instalacao quebra sem dizer porque.
       - name: Publicar release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: assets/*.zip
-          generate_release_notes: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          ls -l assets/
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --generate-notes
+          for asset in assets/*.zip; do
+            gh release upload "$TAG" "$asset" --repo "$GITHUB_REPOSITORY" --clobber
+          done
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets | length as $n | if $n == 5 then "ok: \($n) assets" else error("esperava 5 assets, subiram \($n)") end'
