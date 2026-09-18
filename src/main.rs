@@ -48,6 +48,10 @@ enum Command {
         /// Milliseconds between filesystem polls.
         #[arg(long, default_value_t = DEFAULT_INTERVAL_MS)]
         interval: u64,
+
+        /// Move a newly created loose module into its own folder and reopen it.
+        #[arg(long)]
+        fix: bool,
     },
 
     /// Fail if anything on disk differs from what Generate would write.
@@ -137,7 +141,7 @@ fn run(cli: &Cli) -> Result<()> {
             let root = project_root(cli)?;
             fix(&root, *dry_run, *open)
         }
-        Command::Watch { interval } => {
+        Command::Watch { interval, fix: autofix_on } => {
             let root = project_root(cli)?;
             let mut state = State::new(&root)?;
             let started = Instant::now();
@@ -145,7 +149,15 @@ fn run(cli: &Cli) -> Result<()> {
                 log("up to date");
             }
             log(&format!("primeira pass em {} ms", started.elapsed().as_millis()));
-            watch_loop(&mut state, Duration::from_millis(*interval))
+            if *autofix_on {
+                let loose = loose_modules(&root, &state).len();
+                if loose > 0 {
+                    log(&format!(
+                        "{loose} module(s) already loose; run `modux fix` for those.                          From here on, a new one is moved as it appears"
+                    ));
+                }
+            }
+            watch_loop(&mut state, Duration::from_millis(*interval), *autofix_on)
         }
     }
 }
@@ -177,78 +189,112 @@ fn project_root(cli: &Cli) -> Result<PathBuf> {
 /// init.luau into a ModuleScript of the folder's name, so `script` and
 /// `script.Parent` keep pointing at exactly what they pointed at before. No
 /// require has to be rewritten.
-fn fix(root: &Path, dry_run: bool, open: bool) -> Result<()> {
-    let mut state = State::new(root)?;
-    let targets = find_modules(root, &state.paths());
+fn relocate(file: &Path, siblings: &[PathBuf]) -> Result<PathBuf> {
+    let stem = file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .with_context(|| format!("{} has no usable name", file.display()))?;
+    let folder = file.with_file_name(stem);
+    let destination = folder.join("init.luau");
 
-    let loose: Vec<PathBuf> = targets
+    if folder.exists() {
+        bail!("cannot move {}: {} already exists", file.display(), folder.display());
+    }
+
+    std::fs::create_dir_all(&folder)
+        .with_context(|| format!("could not create {}", folder.display()))?;
+    std::fs::rename(file, &destination)
+        .with_context(|| format!("could not move {}", file.display()))?;
+
+    // A folha que ficou no pai foi escrita para este modulo, e agora pertence a
+    // um caminho que nao existe mais. Sai junto, mas so se nenhum outro modulo
+    // solto ainda a reivindique.
+    let orphan = emit::leaf_path(file);
+    let still_claimed = siblings
+        .iter()
+        .any(|other| other != file && emit::leaf_path(other) == orphan);
+    if !still_claimed && orphan.exists() {
+        let _ = std::fs::remove_file(&orphan);
+    }
+
+    Ok(destination)
+}
+
+/// Reabre o arquivo no VS Code. Silencioso de proposito: sem o `code` no PATH
+/// o caminho impresso no log continua servindo, e falhar aqui nao e motivo para
+/// derrubar uma geracao que deu certo.
+fn reopen(path: &Path) {
+    let _ = std::process::Command::new("code")
+        .arg("--reuse-window")
+        .arg(path)
+        .status();
+}
+
+fn loose_modules(root: &Path, state: &State) -> Vec<PathBuf> {
+    find_modules(root, &state.paths())
         .into_iter()
         .filter(|p| p.file_name().is_some_and(|n| n != "init.luau"))
-        .collect();
+        .collect()
+}
+
+fn fix(root: &Path, dry_run: bool, open: bool) -> Result<()> {
+    let state = State::new(root)?;
+    let loose = loose_modules(root, &state);
 
     if loose.is_empty() {
         log("every module already has its own folder");
         return Ok(());
     }
 
-    let mut moved = Vec::new();
-    for file in &loose {
-        let Some(stem) = file.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let folder = file.with_file_name(stem);
-        let destination = folder.join("init.luau");
-
-        if folder.exists() {
-            bail!(
-                "cannot move {}: {} already exists",
+    if dry_run {
+        for file in &loose {
+            println!(
+                "{}  ->  {}",
                 state.rel(file),
-                state.rel(&folder)
+                state.rel(&file.with_file_name(file.file_stem().unwrap_or_default()).join("init.luau"))
             );
         }
-
-        if dry_run {
-            println!("{}  ->  {}", state.rel(file), state.rel(&destination));
-            continue;
-        }
-
-        std::fs::create_dir_all(&folder)
-            .with_context(|| format!("could not create {}", folder.display()))?;
-        std::fs::rename(file, &destination)
-            .with_context(|| format!("could not move {}", file.display()))?;
-
-        // A folha que ficou no pai foi escrita para este modulo, e agora
-        // pertence a um caminho que nao existe mais. Sai junto, mas so se
-        // nenhum modulo solto sobrou para reivindicar ela.
-        let orphan = emit::leaf_path(file);
-        let still_claimed = loose
-            .iter()
-            .any(|other| other != file && emit::leaf_path(other) == orphan);
-        if !still_claimed && orphan.exists() {
-            let _ = std::fs::remove_file(&orphan);
-        }
-
-        log(&format!("{}  ->  {}", state.rel(file), state.rel(&destination)));
-        moved.push(destination);
-    }
-
-    if dry_run {
         return Ok(());
     }
 
-    if open {
-        for path in &moved {
-            // `code` e o CLI do VS Code; se nao estiver no PATH, o caminho
-            // impresso acima continua servindo.
-            let _ = std::process::Command::new("code")
-                .arg("--reuse-window")
-                .arg(path)
-                .status();
+    for file in &loose {
+        let destination = relocate(file, &loose)?;
+        log(&format!("{}  ->  {}", state.rel(file), state.rel(&destination)));
+        if open {
+            reopen(&destination);
         }
     }
 
     log("run `modux generate` to write the leaves in their new place");
     Ok(())
+}
+
+/// Um modulo que acabou de aparecer e ainda esta solto. Roda so dentro do
+/// watch, e so depois da primeira pass: ali o cache ja conhece tudo que existia
+/// antes, entao um caminho ausente dele e de fato novo — o arquivo que a pessoa
+/// acabou de criar. Mover o projeto inteiro sem pedir seria outra coisa, e para
+/// isso existe `modux fix`.
+fn autofix(state: &mut State) -> bool {
+    let root = state.root.clone();
+    let loose = loose_modules(&root, state);
+    let fresh: Vec<PathBuf> = loose
+        .iter()
+        .filter(|p| !state.cache.contains_key(*p))
+        .cloned()
+        .collect();
+
+    let mut did = false;
+    for file in &fresh {
+        match relocate(file, &loose) {
+            Ok(destination) => {
+                log(&format!("moved: {}  ->  {}", state.rel(file), state.rel(&destination)));
+                reopen(&destination);
+                did = true;
+            }
+            Err(err) => log(&format!("could not move {}: {err:#}", state.rel(file))),
+        }
+    }
+    did
 }
 
 fn is_generated(path: &Path, targets: &[PathBuf]) -> bool {
@@ -502,14 +548,37 @@ fn snapshot(root: &Path, targets: &[PathBuf]) -> BTreeMap<PathBuf, Signature> {
     state
 }
 
-fn watch_loop(state: &mut State, interval: Duration) -> Result<()> {
+fn watch_loop(state: &mut State, interval: Duration, autofix_on: bool) -> Result<()> {
     log(&format!("watching {}/ (Ctrl+C to stop)", SOURCE));
     let mut previous = snapshot(&state.root, &state.paths());
+    let project = state.root.join(PROJECT);
+    let mut project_at = State::signature(&project);
 
     loop {
         std::thread::sleep(interval);
+
+        // O mapa do Rojo era lido uma vez so, na partida. Com o rogen rodando
+        // ao lado, uma feature nova reescreve o project file e o modux seguia
+        // com o mapa velho ate ser reiniciado, errando `path outside
+        // default.project.json` para sempre. E o snapshot nao ajudava: ele
+        // varre src/, e o project file mora na raiz.
+        let now = State::signature(&project);
+        let mut forced = false;
+        if now != project_at {
+            project_at = now;
+            match Map::read(&project) {
+                Ok(map) => {
+                    state.map = map;
+                    state.cache.clear();
+                    log("project file changed, reloaded");
+                    forced = true;
+                }
+                Err(err) => log(&format!("ERROR: could not reload the project file: {err:#}")),
+            }
+        }
+
         let current = snapshot(&state.root, &state.paths());
-        if current == previous {
+        if current == previous && !forced {
             continue;
         }
 
@@ -530,9 +599,23 @@ fn watch_loop(state: &mut State, interval: Duration) -> Result<()> {
         }
         previous = current;
 
+        // Antes da pass: mover primeiro deixa a geracao ja escrever a folha no
+        // lugar novo, em vez de escrever no pai e apagar em seguida.
+        let just_moved = autofix_on && autofix(state);
+        if just_moved {
+            previous = snapshot(&state.root, &state.paths());
+        }
+
         let started = Instant::now();
         match state.pass(false) {
             Ok(_) => log(&format!("regenerated in {} ms", started.elapsed().as_millis())),
+            // Uma pasta que acabou de nascer ainda nao esta no project file, e
+            // so estara quando o rogen correr. Enquanto isso a geracao nao tem
+            // como resolver o caminho — e espera, nao falha, entao nao se
+            // anuncia como erro.
+            Err(err) if just_moved && format!("{err:#}").contains("outside") => {
+                log("waiting for rogen to pick up the new folder")
+            }
             Err(err) => log(&format!("ERROR: {err:#}")),
         }
     }
