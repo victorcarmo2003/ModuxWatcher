@@ -100,11 +100,18 @@ pub fn leaf_path(origin: &Path) -> PathBuf {
 }
 
 pub fn emit(m: &Module) -> String {
-    let mut members: Vec<(String, String)> = m
-        .fields
-        .iter()
-        .map(|c| (c.name.clone(), c.ty.clone()))
-        .collect();
+    let mut members: Vec<(String, String)> = Vec::new();
+
+    // A component object always has the Instance it was built for, so `Public`
+    // is the wrong shape without it. This used to typecheck by accident: the
+    // declaring file sees `self.Instance` because `SelfOf.Build` grafts it on,
+    // and a method body is not rechecked at the call site, so nobody noticed
+    // that the type the Manifest hands out had no Instance on it.
+    if m.kind == "Component" && !m.fields.iter().any(|f| f.name == "Instance") {
+        members.push(("Instance".to_string(), "Instance".to_string()));
+    }
+
+    members.extend(m.fields.iter().map(|c| (c.name.clone(), c.ty.clone())));
     members.extend(m.methods.iter().map(|x| (x.name.clone(), x.signature.clone())));
     let texts: Vec<String> = members.iter().map(|(_, t)| t.clone()).collect();
 

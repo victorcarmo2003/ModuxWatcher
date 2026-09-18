@@ -143,8 +143,45 @@ pub fn emit(
         blocks.push(format!("{}\n", body.join("\n")));
     }
 
+    blocks.push(component_access(&visible));
+
     blocks.push("return {}\n".to_string());
     Ok(Some(blocks.join("\n")))
+}
+
+// One concrete entry per component, rather than a generic
+// `GetComponent<CID>(id: CID, ...) -> index<AllComponents, CID>`.
+//
+// That generic form does typecheck on its own, but it has to reach the module
+// author through the extras of `SelfOf.Build`, and a generic function there
+// stops the type function from reducing. It does not error: `Build<...>` simply
+// stays unevaluated, and the symptom lands somewhere else entirely, as
+// `Cannot add property 'Whatever' to table 'setmetatable<Build<...>, ...>'` on
+// a method declaration that was fine a moment ago.
+//
+// Writing the table out per component keeps the lookup by key with no generic
+// anywhere, which is work this generator is here to do.
+fn component_access(visible: &[&Module]) -> String {
+    let components: Vec<&&Module> = visible.iter().filter(|m| m.kind == "Component").collect();
+    if components.is_empty() {
+        return "export type ComponentAccess = {}\n".to_string();
+    }
+
+    let mut body = vec!["export type ComponentAccess = {".to_string()];
+    for m in components {
+        let public = entry(m);
+        body.push(format!("\t{}: {{", m.id));
+        body.push(format!(
+            "\t\tGet: (self: any, instance: Instance) -> {public}?,"
+        ));
+        body.push(format!(
+            "\t\tCreate: (self: any, instance: Instance) -> {public},"
+        ));
+        body.push(format!("\t\tAll: (self: any) -> {{ {public} }},"));
+        body.push("\t},".to_string());
+    }
+    body.push("}".to_string());
+    format!("{}\n", body.join("\n"))
 }
 
 fn entry(m: &Module) -> String {
