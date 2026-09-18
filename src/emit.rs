@@ -75,6 +75,13 @@ fn has_word(text: &str, name: &str) -> bool {
     false
 }
 
+/// A require is copied into the leaf when the annotation reaches through it,
+/// which is almost always `Alias.Something`. The exception is `typeof(Alias)`,
+/// where the module is named on its own: nothing follows it but the closing
+/// paren, so matching on a trailing dot misses it and the leaf ends up with
+/// `typeof(Template)` and no Template. That reads as an unknown global, the
+/// exported type becomes an error type, and because the Manifest indexes every
+/// leaf, one such line takes down the typing of every module on that side.
 fn cites_alias(texts: &[String], alias: &str) -> bool {
     texts.iter().any(|t| {
         let mut i = 0;
@@ -83,7 +90,8 @@ fn cites_alias(texts: &[String], alias: &str) -> bool {
             let end_at = start_at + alias.len();
             let before_ok = start_at == 0 || !t.as_bytes()[start_at - 1].is_ascii_alphanumeric();
             let after = t[end_at..].trim_start();
-            if before_ok && after.starts_with('.') {
+            let wrapped = after.starts_with(')') && t[..start_at].trim_end().ends_with("typeof(");
+            if before_ok && (after.starts_with('.') || wrapped) {
                 return true;
             }
             i = start_at + 1;
@@ -115,8 +123,6 @@ pub fn emit(m: &Module) -> String {
     members.extend(m.methods.iter().map(|x| (x.name.clone(), x.signature.clone())));
     let texts: Vec<String> = members.iter().map(|(_, t)| t.clone()).collect();
 
-    let requires: Vec<_> = m.requires.iter().filter(|r| cites_alias(&texts, &r.alias)).collect();
-
     let mut locals = Vec::new();
     let mut stale: Vec<_> = m.local_types.iter().collect();
     let mut target = texts.clone();
@@ -136,6 +142,11 @@ pub fn emit(m: &Module) -> String {
             break;
         }
     }
+
+    // After the local types, not before: a local type is copied into the leaf
+    // whole, so a require that only the local type reaches through still has to
+    // come along. `target` is the members plus every local type that was taken.
+    let requires: Vec<_> = m.requires.iter().filter(|r| cites_alias(&target, &r.alias)).collect();
 
     let exprs: Vec<String> = requires.iter().map(|r| rewrite_require(&r.expr)).collect();
     let services: Vec<_> = m
@@ -174,4 +185,31 @@ pub fn emit(m: &Module) -> String {
 
     blocks.push("return {}\n".to_string());
     blocks.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &str) -> Vec<String> {
+        vec![v.to_string()]
+    }
+
+    #[test]
+    fn alias_through_a_dot() {
+        assert!(cites_alias(&s("Signal.Signal<Player>"), "Signal"));
+        assert!(cites_alias(&s("{ a: Lib.Thing, b: number }"), "Lib"));
+    }
+
+    #[test]
+    fn alias_alone_inside_typeof() {
+        assert!(cites_alias(&s("typeof(Template)"), "Template"));
+        assert!(cites_alias(&s("{ data: typeof(Template)? }"), "Template"));
+    }
+
+    #[test]
+    fn a_bare_mention_is_not_a_citation() {
+        assert!(!cites_alias(&s("(Template) -> ()"), "Template"));
+        assert!(!cites_alias(&s("Templated.Thing"), "Template"));
+    }
 }
