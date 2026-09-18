@@ -298,10 +298,6 @@ impl State {
             modules.push(data);
         }
 
-        if modules.is_empty() {
-            bail!("no Modux module found in {SOURCE}/");
-        }
-
         let sides = manifest::validate(&modules, &self.map)?;
 
         for (target, data) in &pending_leaves {
@@ -352,9 +348,6 @@ impl State {
 
     fn check_stale(&mut self) -> Result<Vec<PathBuf>> {
         let modules = self.modules()?;
-        if modules.is_empty() {
-            bail!("no Modux module found in {SOURCE}/");
-        }
         let mut stale = Vec::new();
 
         let sides = manifest::validate(&modules, &self.map)?;
