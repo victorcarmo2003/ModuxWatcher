@@ -58,7 +58,7 @@ local FSM = require(ReplicatedStorage.shared.Utils.FSM)
 
 type Estado = "Idle" | "Run" | "Attack"
 
-const Zombie = Classes.Controller("Zombie")
+const Zombie = Classes.Controller("Zombie", { Require = { "Skeleton" } })
 
 function Zombie:Setup()
 	self.Vida = 100
@@ -98,15 +98,35 @@ export type Public = {
 return {}
 ```
 
-E a entrada no Manifest, com a dependência que ele viu no corpo:
+E as entradas no Manifest do lado, que são folha crua — nenhuma type function
+mora aqui, de propósito:
 
 ```lua
-Zombie: SelfOf.Build<Zombie.Public, { Skeleton: Skeleton.Public }>,
+export type AllControllers = {
+	Zombie: Zombie.Public,
+	Skeleton: Skeleton.Public,
+}
+
+export type ComponentAccess = {
+	HighlightComponent: {
+		Get: (self: any, instance: Instance) -> HighlightComponent.Public?,
+		Create: (self: any, instance: Instance) -> HighlightComponent.Public,
+		All: (self: any) -> { HighlightComponent.Public },
+	},
+}
 ```
 
-Você não declarou `Require`. A dependência sai do uso de `self.Dependencies.X`.
-O `Require` que você escrever continua sendo lido, mas só como override manual
-da ordem de load.
+`ComponentAccess` é o que faz `self.Components.HighlightComponent:Get(inst)`
+devolver o tipo certo sem genérico. Uma entrada concreta por componente, porque
+função genérica dentro dos extras do `SelfOf.Build` impede a type function de
+reduzir — e falha em silêncio, reclamando de outra linha.
+
+A dependência vem do `Require` que você declara. O gerador valida os dois lados:
+um Controller de client que exige um Service de server interrompe a geração,
+com uma mensagem dizendo qual está de que lado.
+
+O uso de `self.Dependencies.X` também é extraído, mas só para o `modux list`
+mostrar; ele não entra no tipo.
 
 ## Regras
 
