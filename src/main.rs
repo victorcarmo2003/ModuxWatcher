@@ -333,12 +333,20 @@ impl State {
             }
         }
 
+        let libs = self.root.join(manifest::LIBS_TARGET);
+        let text = manifest::emit_libs(&self.root, &self.map)?;
+        if Self::write_if_changed(&libs, &text)? {
+            log(&format!("libs: {}", self.rel(&libs)));
+            changed = true;
+        }
+
         Ok(changed)
     }
 
     fn paths(&self) -> Vec<PathBuf> {
         let mut all: Vec<PathBuf> = self.targets.iter().map(|(_, p)| p.clone()).collect();
         all.extend(self.module_lists.iter().map(|(_, p)| p.clone()));
+        all.push(self.root.join(manifest::LIBS_TARGET));
         all
     }
 
@@ -374,6 +382,13 @@ impl State {
                 stale.push(target);
             }
         }
+
+        let libs = self.root.join(manifest::LIBS_TARGET);
+        let text = manifest::emit_libs(&self.root, &self.map)?;
+        if std::fs::read_to_string(&libs).ok().as_deref() != Some(text.as_str()) {
+            stale.push(libs);
+        }
+
         Ok(stale)
     }
 }
