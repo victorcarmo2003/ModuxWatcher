@@ -56,6 +56,17 @@ enum Command {
     /// Print every module found, with its id, kind and side.
     List,
 
+    /// Move every module that is a loose file into a folder of its own.
+    Fix {
+        /// Report what would move, without touching anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Reopen each moved module in VS Code.
+        #[arg(long)]
+        open: bool,
+    },
+
     /// Dump the extracted shape of one module as JSON, for debugging.
     Extract {
         /// Module to inspect.
@@ -122,6 +133,10 @@ fn run(cli: &Cli) -> Result<()> {
             }
             Ok(())
         }
+        Command::Fix { dry_run, open } => {
+            let root = project_root(cli)?;
+            fix(&root, *dry_run, *open)
+        }
         Command::Watch { interval } => {
             let root = project_root(cli)?;
             let mut state = State::new(&root)?;
@@ -154,6 +169,86 @@ fn project_root(cli: &Cli) -> Result<PathBuf> {
             );
         }
     }
+}
+
+/// A module written as `Foo.luau` puts its type leaf in the parent folder, where
+/// it collides with every other loose module beside it. Moving the code to
+/// `Foo/init.luau` fixes that, and it is safe: Rojo turns a folder with an
+/// init.luau into a ModuleScript of the folder's name, so `script` and
+/// `script.Parent` keep pointing at exactly what they pointed at before. No
+/// require has to be rewritten.
+fn fix(root: &Path, dry_run: bool, open: bool) -> Result<()> {
+    let mut state = State::new(root)?;
+    let targets = find_modules(root, &state.paths());
+
+    let loose: Vec<PathBuf> = targets
+        .into_iter()
+        .filter(|p| p.file_name().is_some_and(|n| n != "init.luau"))
+        .collect();
+
+    if loose.is_empty() {
+        log("every module already has its own folder");
+        return Ok(());
+    }
+
+    let mut moved = Vec::new();
+    for file in &loose {
+        let Some(stem) = file.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let folder = file.with_file_name(stem);
+        let destination = folder.join("init.luau");
+
+        if folder.exists() {
+            bail!(
+                "cannot move {}: {} already exists",
+                state.rel(file),
+                state.rel(&folder)
+            );
+        }
+
+        if dry_run {
+            println!("{}  ->  {}", state.rel(file), state.rel(&destination));
+            continue;
+        }
+
+        std::fs::create_dir_all(&folder)
+            .with_context(|| format!("could not create {}", folder.display()))?;
+        std::fs::rename(file, &destination)
+            .with_context(|| format!("could not move {}", file.display()))?;
+
+        // A folha que ficou no pai foi escrita para este modulo, e agora
+        // pertence a um caminho que nao existe mais. Sai junto, mas so se
+        // nenhum modulo solto sobrou para reivindicar ela.
+        let orphan = emit::leaf_path(file);
+        let still_claimed = loose
+            .iter()
+            .any(|other| other != file && emit::leaf_path(other) == orphan);
+        if !still_claimed && orphan.exists() {
+            let _ = std::fs::remove_file(&orphan);
+        }
+
+        log(&format!("{}  ->  {}", state.rel(file), state.rel(&destination)));
+        moved.push(destination);
+    }
+
+    if dry_run {
+        return Ok(());
+    }
+
+    if open {
+        for path in &moved {
+            // `code` e o CLI do VS Code; se nao estiver no PATH, o caminho
+            // impresso acima continua servindo.
+            let _ = std::process::Command::new("code")
+                .arg("--reuse-window")
+                .arg(path)
+                .status();
+        }
+    }
+
+    log("run `modux generate` to write the leaves in their new place");
+    Ok(())
 }
 
 fn is_generated(path: &Path, targets: &[PathBuf]) -> bool {

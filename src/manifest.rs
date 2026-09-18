@@ -42,6 +42,28 @@ pub fn validate(modules: &[Module], map: &Map) -> Result<BTreeMap<String, Side>>
         }
     }
 
+    // Dois modulos na mesma pasta escreveriam o mesmo Type.luau, e o segundo
+    // sobrescreve o primeiro sem reclamar. O Manifest fica apontando os dois
+    // IDs para a folha de um so, entao um modulo passa a ter os metodos do
+    // outro e o erro nao aparece em lugar nenhum: o tipo esta errado, nao
+    // ausente. Por isso isto e um bail, nao um warning.
+    let mut leaves: BTreeMap<PathBuf, &Module> = BTreeMap::new();
+    for m in modules {
+        let leaf = crate::emit::leaf_path(Path::new(&m.file));
+        if let Some(previous) = leaves.insert(leaf.clone(), m) {
+            let shown = leaf.to_string_lossy().replace('\\', "/");
+            bail!(
+                "{} and {} would both write {}.\n  \
+                 A module needs a folder of its own, with the code in init.luau, \
+                 because the type leaf is written beside it.\n  \
+                 Run `modux fix` to move each one into its own folder.",
+                previous.file,
+                m.file,
+                shown
+            );
+        }
+    }
+
     let mut sides: BTreeMap<String, Side> = BTreeMap::new();
     for m in modules {
         sides.insert(m.id.clone(), map.side(Path::new(&m.file))?);
