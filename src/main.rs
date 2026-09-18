@@ -109,10 +109,14 @@ fn run(cli: &Cli) -> Result<()> {
             let root = project_root(cli)?;
             let mut state = State::new(&root)?;
             for m in state.modules()? {
-                let deps = if m.dependencies.is_empty() {
+                // What the module declared, not what it was seen using. The
+                // inferred `dependencies` only covers reads inside a declared
+                // method, so a Require used from OnInit would go missing here
+                // and the listing would read as if it had not been declared.
+                let deps = if m.declared_require.is_empty() {
                     "-".to_string()
                 } else {
-                    m.dependencies.join(", ")
+                    m.declared_require.join(", ")
                 };
                 println!("{:<12} {:<10} {}  deps: {}", m.id, m.kind, m.file, deps);
             }
