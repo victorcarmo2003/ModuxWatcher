@@ -178,6 +178,9 @@ fn component_access(visible: &[&Module]) -> String {
             "\t\tCreate: (self: any, instance: Instance) -> {public},"
         ));
         body.push(format!("\t\tAll: (self: any) -> {{ {public} }},"));
+        // Create exists so nobody has to touch the tag by hand; Destroy has to
+        // exist for the same reason, or the only way back out is RemoveTag.
+        body.push("\t\tDestroy: (self: any, instance: Instance) -> (),".to_string());
         body.push("\t},".to_string());
     }
     body.push("}".to_string());
