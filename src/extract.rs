@@ -215,14 +215,17 @@ impl Visitor for BodyScan {
 pub struct Extractor {
     path: PathBuf,
     ast: Ast,
+    broken: Option<crate::ast::Syntax>,
     issues: Vec<Issue>,
 }
 
 impl Extractor {
     pub fn new(path: &Path) -> Result<Self> {
+        let (ast, broken) = ast::parse(path)?;
         Ok(Self {
             path: path.to_path_buf(),
-            ast: ast::parse(path)?,
+            ast,
+            broken,
             issues: Vec::new(),
         })
     }
@@ -307,6 +310,18 @@ impl Extractor {
     }
 
     pub fn run(mut self) -> Result<Module> {
+        // O arquivo nao fechou, mas a arvore reconstruida pode ter conservado o
+        // suficiente. Vira um aviso na lista, nao uma recusa: o que sobrou
+        // ainda serve, e o leaf de agora e melhor que o leaf de tres teclas
+        // atras.
+        if let Some(broken) = self.broken.take() {
+            self.issues.push(Issue {
+                line: broken.line.unwrap_or(0),
+                column: 0,
+                message: "file does not parse yet; typed from what was readable".to_string(),
+            });
+        }
+
         let Some((local_name, id, declared_require, kind)) = self.declaration() else {
             bail!(
                 "{}: no call to Controller, Service or Component found",

@@ -34,20 +34,31 @@ fn first_line(message: &str) -> Option<usize> {
         .ok()
 }
 
-pub fn parse(path: &Path) -> Result<Ast> {
+/// Devolve a arvore e, quando o arquivo nao fecha, o que faltou.
+///
+/// `parse_fallible` reconstroi uma arvore mesmo com erro, e e isso que salva a
+/// digitacao: quem escreve `self.` numa funcao la embaixo nao pode perder o
+/// tipo das funcoes que ja estavam prontas acima. Descartar a arvore inteira
+/// por causa de um trecho incompleto era o que congelava a tipagem do arquivo
+/// ate a ultima tecla.
+///
+/// Quem chama decide o que fazer com o resto: se a declaracao do modulo
+/// sobreviveu a reconstrucao, da para gerar; se nao, `Extractor::run` reclama
+/// por conta propria.
+pub fn parse(path: &Path) -> Result<(Ast, Option<Syntax>)> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("could not read {}", path.display()))?;
 
-    full_moon::parse_fallible(&text, full_moon::LuaVersion::luau())
-        .into_result()
-        .map_err(|errors| {
-            let shown: Vec<String> = errors.iter().take(3).map(ToString::to_string).collect();
-            anyhow::Error::from(Syntax {
-                line: shown.first().and_then(|m| first_line(m)),
-                file: path.to_path_buf(),
-                detail: shown.join("\n  "),
-            })
-        })
+    let parsed = full_moon::parse_fallible(&text, full_moon::LuaVersion::luau());
+    let shown: Vec<String> = parsed.errors().iter().take(3).map(ToString::to_string).collect();
+
+    let broken = shown.first().map(|first| Syntax {
+        line: first_line(first),
+        file: path.to_path_buf(),
+        detail: shown.join("\n  "),
+    });
+
+    Ok((parsed.into_ast(), broken))
 }
 
 // full_moon renders a node completely through Display, but the text carries the

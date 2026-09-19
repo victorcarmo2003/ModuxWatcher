@@ -52,6 +52,10 @@ enum Command {
         /// Move a newly created loose module into its own folder and reopen it.
         #[arg(long)]
         fix: bool,
+
+        /// Rewrite the sourcemap after a leaf changes, to wake the language server.
+        #[arg(long)]
+        nudge: bool,
     },
 
     /// Fail if anything on disk differs from what Generate would write.
@@ -141,7 +145,7 @@ fn run(cli: &Cli) -> Result<()> {
             let root = project_root(cli)?;
             fix(&root, *dry_run, *open)
         }
-        Command::Watch { interval, fix: autofix_on } => {
+        Command::Watch { interval, fix: autofix_on, nudge } => {
             let root = project_root(cli)?;
             let mut state = State::new(&root)?;
             let started = Instant::now();
@@ -157,7 +161,7 @@ fn run(cli: &Cli) -> Result<()> {
                     ));
                 }
             }
-            watch_loop(&mut state, Duration::from_millis(*interval), *autofix_on)
+            watch_loop(&mut state, Duration::from_millis(*interval), *autofix_on, *nudge)
         }
     }
 }
@@ -548,7 +552,33 @@ fn snapshot(root: &Path, targets: &[PathBuf]) -> BTreeMap<PathBuf, Signature> {
     state
 }
 
-fn watch_loop(state: &mut State, interval: Duration, autofix_on: bool) -> Result<()> {
+/// Reescreve o sourcemap com o proprio conteudo.
+///
+/// Mudar so o CORPO de um Type.luau nao altera a arvore do projeto, entao o
+/// `rojo sourcemap --watch` nao reescreve nada — medido — e o language server
+/// fica sem o aviso que ele de fato escuta. O arquivo tem alguns KB, e um write
+/// e o evento mais barato que o alcanca. Nao ha risco de laco: o rojo observa o
+/// project file e as fontes, nunca o sourcemap que ele mesmo emite.
+fn nudge_sourcemap(root: &Path) {
+    let path = root.join("sourcemap.json");
+    let Ok(text) = std::fs::read_to_string(&path) else { return };
+
+    // Escrita atomica, porque o `rojo sourcemap --watch` pode estar escrevendo
+    // o mesmo arquivo: um write direto deixaria uma janela em que o server le
+    // JSON pela metade. Com rename no mesmo volume, quem le ve a versao velha
+    // ou a nova, nunca um meio-termo.
+    let temporary = path.with_extension("json.nudge");
+    if std::fs::write(&temporary, text).is_ok() && std::fs::rename(&temporary, &path).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+}
+
+fn watch_loop(
+    state: &mut State,
+    interval: Duration,
+    autofix_on: bool,
+    nudge: bool,
+) -> Result<()> {
     log(&format!("watching {}/ (Ctrl+C to stop)", SOURCE));
     let mut previous = snapshot(&state.root, &state.paths());
     let project = state.root.join(PROJECT);
@@ -608,7 +638,12 @@ fn watch_loop(state: &mut State, interval: Duration, autofix_on: bool) -> Result
 
         let started = Instant::now();
         match state.pass(false) {
-            Ok(_) => log(&format!("regenerated in {} ms", started.elapsed().as_millis())),
+            Ok(changed) => {
+                if changed && nudge {
+                    nudge_sourcemap(&state.root);
+                }
+                log(&format!("regenerated in {} ms", started.elapsed().as_millis()))
+            }
             // Uma pasta que acabou de nascer ainda nao esta no project file, e
             // so estara quando o rogen correr. Enquanto isso a geracao nao tem
             // como resolver o caminho — e espera, nao falha, entao nao se
