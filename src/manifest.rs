@@ -8,15 +8,62 @@ use crate::extract::Module;
 use crate::rojo::{Side, Map};
 
 
-pub const TARGETS: [(Side, &str); 2] = [
-    (Side::Client, "src/Modux/client/Manifest/init.luau"),
-    (Side::Server, "src/Modux/server/Manifest/init.luau"),
-];
+/// Onde o framework mora no disco.
+///
+/// Com o rogen, a arvore do jogo e DERIVADA das pastas: `src/Modux/client`
+/// vira `StarterPlayerScripts.client.Modux`, e o project file guarda essa
+/// traducao. Num sync Studio-first nao ha traducao nenhuma — o disco JA E a
+/// arvore —, entao os mesmos arquivos precisam nascer no caminho inteiro.
+///
+/// As duas formas apontam para as mesmas instancias no fim, e e isso que
+/// importa: `require(ServerScriptService.server.Modux)` continua valendo nos
+/// dois fluxos, sem ninguem reescrever require nenhum.
+pub struct Layout {
+    pub source: PathBuf,
+    pub targets: Vec<(Side, PathBuf)>,
+    pub module_lists: Vec<(Side, PathBuf)>,
+    pub libs_dir: PathBuf,
+    pub libs_target: PathBuf,
+}
 
-pub const MODULE_LISTS: [(Side, &str); 2] = [
-    (Side::Client, "src/Modux/client/Modules.luau"),
-    (Side::Server, "src/Modux/server/Modules.luau"),
-];
+impl Layout {
+    /// O disco descreve pastas e o rogen traduz para a arvore.
+    pub fn rogen(source: &Path) -> Self {
+        Self {
+            source: source.to_path_buf(),
+            targets: vec![
+                (Side::Client, source.join("Modux/client/Manifest/init.luau")),
+                (Side::Server, source.join("Modux/server/Manifest/init.luau")),
+            ],
+            module_lists: vec![
+                (Side::Client, source.join("Modux/client/Modules.luau")),
+                (Side::Server, source.join("Modux/server/Modules.luau")),
+            ],
+            libs_dir: source.join("Libs"),
+            libs_target: source.join("Modux/shared/Libs.luau"),
+        }
+    }
+
+    /// O disco E a arvore, entao o caminho carrega o servico inteiro.
+    pub fn mirror(source: &Path) -> Self {
+        let client = source.join("StarterPlayer/StarterPlayerScripts/client");
+        let server = source.join("ServerScriptService/server");
+        let shared = source.join("ReplicatedStorage/shared");
+        Self {
+            source: source.to_path_buf(),
+            targets: vec![
+                (Side::Client, client.join("Modux/Manifest/init.luau")),
+                (Side::Server, server.join("Modux/Manifest/init.luau")),
+            ],
+            module_lists: vec![
+                (Side::Client, client.join("Modux/Modules.luau")),
+                (Side::Server, server.join("Modux/Modules.luau")),
+            ],
+            libs_dir: shared.join("Libs"),
+            libs_target: shared.join("Modux/Libs.luau"),
+        }
+    }
+}
 
 fn buckets(side: Side) -> &'static [(&'static str, &'static str)] {
     match side {
@@ -26,13 +73,6 @@ fn buckets(side: Side) -> &'static [(&'static str, &'static str)] {
     }
 }
 
-pub fn targets(root: &Path) -> Vec<(Side, PathBuf)> {
-    TARGETS.iter().map(|(l, p)| (*l, root.join(p))).collect()
-}
-
-pub fn module_lists(root: &Path) -> Vec<(Side, PathBuf)> {
-    MODULE_LISTS.iter().map(|(l, p)| (*l, root.join(p))).collect()
-}
 
 pub fn validate(modules: &[Module], map: &Map) -> Result<BTreeMap<String, Side>> {
     let mut by_id: BTreeMap<&str, &Module> = BTreeMap::new();
@@ -238,8 +278,6 @@ pub fn emit_module_list(
     Ok(Some(out))
 }
 
-pub const LIBS_DIR: &str = "src/Libs";
-pub const LIBS_TARGET: &str = "src/Modux/shared/Libs.luau";
 
 // Libs sao dependencia de DADOS, nao de codigo. O core nao requer Promise nem
 // Signal nem rede; ele requer este arquivo, que o gerador escreve a partir do
@@ -249,8 +287,8 @@ pub const LIBS_TARGET: &str = "src/Modux/shared/Libs.luau";
 // `typeof(X)` em vez de `X.Api` de proposito: assim a lib nao precisa aderir a
 // contrato nenhum para entrar. Promise exporta PromiseAPI, Signal exporta Api,
 // e nenhum dos dois precisou mudar.
-pub fn emit_libs(root: &Path, map: &Map) -> Result<String> {
-    let dir = root.join(LIBS_DIR);
+pub fn emit_libs(root: &Path, dir: &Path, map: &Map) -> Result<String> {
+    let dir = root.join(dir);
     let mut libs: Vec<(String, String)> = Vec::new();
 
     if dir.is_dir() {

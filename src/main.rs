@@ -18,6 +18,7 @@ use rojo::Map;
 
 const PROJECT: &str = "default.project.json";
 const SOURCE: &str = "src";
+const MIRROR_SOURCE: &str = "sync";
 const DEFAULT_INTERVAL_MS: u64 = 400;
 
 #[derive(Parser)]
@@ -33,6 +34,10 @@ const DEFAULT_INTERVAL_MS: u64 = 400;
 struct Cli {
     #[arg(long, short, global = true, value_name = "PATH")]
     project: Option<PathBuf>,
+
+    /// Folder the generator scans. Defaults to `src`, or to `sync` with --sourcemap.
+    #[arg(long, global = true, value_name = "DIR")]
+    source: Option<PathBuf>,
 
     /// Take the instance tree from a sourcemap instead of default.project.json.
     ///
@@ -140,6 +145,29 @@ impl Source {
     fn owns_sourcemap(&self) -> bool {
         matches!(self, Source::Project(_))
     }
+
+    /// O project file implica o rogen traduzindo pastas; o sourcemap implica
+    /// que o disco ja e a arvore. Sao nomes diferentes para a mesma pergunta,
+    /// mas quem le `layout_for` esta perguntando pelo layout, nao por quem
+    /// mantem o sourcemap.
+    fn is_project(&self) -> bool {
+        matches!(self, Source::Project(_))
+    }
+}
+
+/// O layout acompanha a fonte do mapa porque os dois descrevem a mesma coisa
+/// por caminhos diferentes, e misturar daria um gerador varrendo uma arvore e
+/// escrevendo noutra. Quem usa sourcemap esta num sync Studio-first, onde o
+/// disco ja e a arvore; quem usa project file esta com o rogen traduzindo.
+fn layout_for(cli: &Cli, source: &Source) -> manifest::Layout {
+    let pasta = cli.source.clone().unwrap_or_else(|| {
+        PathBuf::from(if source.is_project() { SOURCE } else { MIRROR_SOURCE })
+    });
+    if source.is_project() {
+        manifest::Layout::rogen(&pasta)
+    } else {
+        manifest::Layout::mirror(&pasta)
+    }
 }
 
 fn run(cli: &Cli) -> Result<()> {
@@ -152,7 +180,7 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Generate => {
             let root = project_root(cli)?;
             let source = Source::from(cli, &root);
-            let mut state = State::new(&root, &source)?;
+            let mut state = State::new(&root, &source, layout_for(cli, &source))?;
             let started = Instant::now();
             let changed = state.pass(true)?;
             if !changed {
@@ -164,7 +192,7 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Check => {
             let root = project_root(cli)?;
             let source = Source::from(cli, &root);
-            let mut state = State::new(&root, &source)?;
+            let mut state = State::new(&root, &source, layout_for(cli, &source))?;
             let stale = state.check_stale()?;
             if stale.is_empty() {
                 log("up to date");
@@ -181,7 +209,7 @@ fn run(cli: &Cli) -> Result<()> {
         Command::List => {
             let root = project_root(cli)?;
             let source = Source::from(cli, &root);
-            let mut state = State::new(&root, &source)?;
+            let mut state = State::new(&root, &source, layout_for(cli, &source))?;
             for m in state.modules()? {
                 // What the module declared, not what it was seen using. The
                 // inferred `dependencies` only covers reads inside a declared
@@ -199,12 +227,12 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Fix { dry_run, open } => {
             let root = project_root(cli)?;
             let source = Source::from(cli, &root);
-            fix(&root, &source, *dry_run, *open)
+            fix(&root, &source, layout_for(cli, &source), *dry_run, *open)
         }
         Command::Watch { interval, fix: autofix_on, nudge } => {
             let root = project_root(cli)?;
             let source = Source::from(cli, &root);
-            let mut state = State::new(&root, &source)?;
+            let mut state = State::new(&root, &source, layout_for(cli, &source))?;
             let started = Instant::now();
             if !state.pass(true)? {
                 log("up to date");
@@ -310,14 +338,14 @@ fn reopen(path: &Path) {
 }
 
 fn loose_modules(root: &Path, state: &State) -> Vec<PathBuf> {
-    find_modules(root, &state.paths())
+    find_modules(root, &state.layout.source, &state.paths())
         .into_iter()
         .filter(|p| p.file_name().is_some_and(|n| n != "init.luau"))
         .collect()
 }
 
-fn fix(root: &Path, source: &Source, dry_run: bool, open: bool) -> Result<()> {
-    let state = State::new(root, source)?;
+fn fix(root: &Path, source: &Source, layout: manifest::Layout, dry_run: bool, open: bool) -> Result<()> {
+    let state = State::new(root, source, layout)?;
     let loose = loose_modules(root, &state);
 
     if loose.is_empty() {
@@ -384,9 +412,9 @@ fn is_generated(path: &Path, targets: &[PathBuf]) -> bool {
     targets.iter().any(|d| d.canonicalize().is_ok_and(|b| a == b))
 }
 
-fn find_modules(root: &Path, targets: &[PathBuf]) -> Vec<PathBuf> {
+fn find_modules(root: &Path, source: &Path, targets: &[PathBuf]) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    for entry in WalkDir::new(root.join(SOURCE)).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(root.join(source)).into_iter().filter_map(Result::ok) {
         let path = entry.path();
         if !path.is_file() || path.extension().is_none_or(|e| e != "luau") {
             continue;
@@ -430,18 +458,16 @@ type Signature = (SystemTime, u64);
 struct State {
     root: PathBuf,
     map: Map,
-    targets: Vec<(crate::rojo::Side, PathBuf)>,
-    module_lists: Vec<(crate::rojo::Side, PathBuf)>,
+    layout: manifest::Layout,
     cache: BTreeMap<PathBuf, (Signature, Module)>,
 }
 
 impl State {
-    fn new(root: &Path, source: &Source) -> Result<Self> {
+    fn new(root: &Path, source: &Source, layout: manifest::Layout) -> Result<Self> {
         Ok(Self {
             root: root.to_path_buf(),
             map: source.read()?,
-            targets: manifest::targets(root),
-            module_lists: manifest::module_lists(root),
+            layout,
             cache: BTreeMap::new(),
         })
     }
@@ -475,7 +501,7 @@ impl State {
     }
 
     fn modules(&mut self) -> Result<Vec<Module>> {
-        let targets_list = find_modules(&self.root, &self.paths());
+        let targets_list = find_modules(&self.root, &self.layout.source, &self.paths());
         let mut out = Vec::new();
         for target in targets_list {
             out.push(self.extract(&target)?.0);
@@ -498,7 +524,7 @@ impl State {
     }
 
     fn pass(&mut self, verbose: bool) -> Result<bool> {
-        let targets_list = find_modules(&self.root, &self.paths());
+        let targets_list = find_modules(&self.root, &self.layout.source, &self.paths());
         let seen: Vec<PathBuf> = targets_list.clone();
         self.cache.retain(|k, _| seen.contains(k));
 
@@ -532,7 +558,7 @@ impl State {
             }
         }
 
-        for (side, target) in self.targets.clone() {
+        for (side, target) in self.layout.targets.clone() {
             let Some(text) = manifest::emit(side, &modules, &sides, &self.map)? else {
                 continue;
             };
@@ -543,7 +569,7 @@ impl State {
             }
         }
 
-        for (side, target) in self.module_lists.clone() {
+        for (side, target) in self.layout.module_lists.clone() {
             let Some(text) = manifest::emit_module_list(side, &modules, &sides, &self.map)? else {
                 continue;
             };
@@ -553,8 +579,8 @@ impl State {
             }
         }
 
-        let libs = self.root.join(manifest::LIBS_TARGET);
-        let text = manifest::emit_libs(&self.root, &self.map)?;
+        let libs = self.layout.libs_target.clone();
+        let text = manifest::emit_libs(&self.root, &self.layout.libs_dir, &self.map)?;
         if Self::write_if_changed(&libs, &text)? {
             log(&format!("libs: {}", self.rel(&libs)));
             changed = true;
@@ -564,9 +590,9 @@ impl State {
     }
 
     fn paths(&self) -> Vec<PathBuf> {
-        let mut all: Vec<PathBuf> = self.targets.iter().map(|(_, p)| p.clone()).collect();
-        all.extend(self.module_lists.iter().map(|(_, p)| p.clone()));
-        all.push(self.root.join(manifest::LIBS_TARGET));
+        let mut all: Vec<PathBuf> = self.layout.targets.iter().map(|(_, p)| p.clone()).collect();
+        all.extend(self.layout.module_lists.iter().map(|(_, p)| p.clone()));
+        all.push(self.layout.libs_target.clone());
         all
     }
 
@@ -583,7 +609,7 @@ impl State {
                 stale.push(leaf);
             }
         }
-        for (side, target) in self.targets.clone() {
+        for (side, target) in self.layout.targets.clone() {
             let Some(text) = manifest::emit(side, &modules, &sides, &self.map)? else {
                 continue;
             };
@@ -591,7 +617,7 @@ impl State {
                 stale.push(target);
             }
         }
-        for (side, target) in self.module_lists.clone() {
+        for (side, target) in self.layout.module_lists.clone() {
             let Some(text) = manifest::emit_module_list(side, &modules, &sides, &self.map)? else {
                 continue;
             };
@@ -600,8 +626,8 @@ impl State {
             }
         }
 
-        let libs = self.root.join(manifest::LIBS_TARGET);
-        let text = manifest::emit_libs(&self.root, &self.map)?;
+        let libs = self.layout.libs_target.clone();
+        let text = manifest::emit_libs(&self.root, &self.layout.libs_dir, &self.map)?;
         if std::fs::read_to_string(&libs).ok().as_deref() != Some(text.as_str()) {
             stale.push(libs);
         }
@@ -610,9 +636,9 @@ impl State {
     }
 }
 
-fn snapshot(root: &Path, targets: &[PathBuf]) -> BTreeMap<PathBuf, Signature> {
+fn snapshot(root: &Path, source: &Path, targets: &[PathBuf]) -> BTreeMap<PathBuf, Signature> {
     let mut state = BTreeMap::new();
-    for entry in WalkDir::new(root.join(SOURCE)).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(root.join(source)).into_iter().filter_map(Result::ok) {
         let path = entry.path();
         if !path.is_file() || path.extension().is_none_or(|e| e != "luau") {
             continue;
@@ -683,8 +709,8 @@ fn watch_loop(
     autofix_on: bool,
     nudge: bool,
 ) -> Result<()> {
-    log(&format!("watching {}/ (Ctrl+C to stop)", SOURCE));
-    let mut previous = snapshot(&state.root, &state.paths());
+    log(&format!("watching {}/ (Ctrl+C to stop)", state.layout.source.display()));
+    let mut previous = snapshot(&state.root, &state.layout.source, &state.paths());
     let origem = source.file().to_path_buf();
     let mut origem_at = State::signature(&origem);
 
@@ -711,7 +737,7 @@ fn watch_loop(
             }
         }
 
-        let current = snapshot(&state.root, &state.paths());
+        let current = snapshot(&state.root, &state.layout.source, &state.paths());
         if current == previous && !forced {
             continue;
         }
@@ -747,7 +773,7 @@ fn watch_loop(
         // lugar novo, em vez de escrever no pai e apagar em seguida.
         let just_moved = autofix_on && autofix(state);
         if just_moved {
-            previous = snapshot(&state.root, &state.paths());
+            previous = snapshot(&state.root, &state.layout.source, &state.paths());
             tree_moved = true;
         }
 
