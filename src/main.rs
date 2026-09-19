@@ -552,20 +552,21 @@ fn snapshot(root: &Path, targets: &[PathBuf]) -> BTreeMap<PathBuf, Signature> {
     state
 }
 
-/// Reescreve o sourcemap com o proprio conteudo.
+/// Regera o sourcemap do zero, chamando o rojo.
 ///
-/// Mudar so o CORPO de um Type.luau nao altera a arvore do projeto, entao o
-/// `rojo sourcemap --watch` nao reescreve nada — medido — e o language server
-/// fica sem o aviso que ele de fato escuta. O arquivo tem alguns KB, e um write
-/// e o evento mais barato que o alcanca. Nao ha risco de laco: o rojo observa o
-/// project file e as fontes, nunca o sourcemap que ele mesmo emite.
-/// Regera o sourcemap chamando o rojo.
+/// Duas coisas obrigam a isto, e nenhuma delas se resolve sozinha:
 ///
 /// O `rojo sourcemap --watch` le o default.project.json uma vez, na partida, e
 /// nunca mais. Renomear uma pasta muda a arvore, o rogen reescreve o project
 /// file, e o watch do rojo segue observando a arvore velha: o sourcemap
 /// congela e o language server passa a resolver caminhos que nao existem mais.
 /// Medido num projeto real, com o sourcemap vinte minutos atras do disco.
+///
+/// Pior, o mesmo watch MORRE quando uma pasta observada e apagada. No Rojo
+/// 7.7.0: `called Result::unwrap() on an Err value: ... Canonicalize`, em
+/// change_processor.rs:179. Dali em diante o sourcemap.json e um arquivo
+/// parado: nenhuma edicao seguinte chega nele. Um processo morto nao volta
+/// sozinho, entao quem repara e este rebuild.
 ///
 /// Falhar aqui nao e motivo para derrubar nada: sem o rojo no PATH, o estado
 /// volta a ser o de antes.
@@ -579,6 +580,13 @@ fn rebuild_sourcemap(root: &Path) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// Reescreve o sourcemap com o proprio conteudo.
+///
+/// Mudar so o CORPO de um Type.luau nao altera a arvore do projeto, entao o
+/// `rojo sourcemap --watch` nao reescreve nada — medido — e o language server
+/// fica sem o aviso que ele de fato escuta. O arquivo tem alguns KB, e um write
+/// e o evento mais barato que o alcanca. Nao ha risco de laco: o rojo observa o
+/// project file e as fontes, nunca o sourcemap que ele mesmo emite.
 fn nudge_sourcemap(root: &Path) {
     let path = root.join("sourcemap.json");
     let Ok(text) = std::fs::read_to_string(&path) else { return };
@@ -620,15 +628,7 @@ fn watch_loop(
                 Ok(map) => {
                     state.map = map;
                     state.cache.clear();
-                    // A arvore mudou, entao o sourcemap que o rojo mantem ficou
-                    // para tras. Regerar aqui e o unico ponto do fluxo que sabe
-                    // que isso aconteceu.
-                    let redone = nudge && rebuild_sourcemap(&state.root);
-                    log(if redone {
-                        "project file changed, reloaded and sourcemap rebuilt"
-                    } else {
-                        "project file changed, reloaded"
-                    });
+                    log("project file changed, reloaded");
                     forced = true;
                 }
                 Err(err) => log(&format!("ERROR: could not reload the project file: {err:#}")),
@@ -642,6 +642,10 @@ fn watch_loop(
 
         let paths: std::collections::BTreeSet<&PathBuf> =
             current.keys().chain(previous.keys()).collect();
+        // Editar o corpo de um arquivo nao mexe na arvore; um arquivo que nasce
+        // ou some, sim. So o segundo caso obriga a refazer o sourcemap, e a
+        // diferenca importa porque refazer custa uns 400 ms.
+        let mut tree_moved = false;
         for path in paths {
             let a = previous.get(path);
             let b = current.get(path);
@@ -649,8 +653,14 @@ fn watch_loop(
                 continue;
             }
             let label = match (a, b) {
-                (None, _) => "new",
-                (_, None) => "deleted",
+                (None, _) => {
+                    tree_moved = true;
+                    "new"
+                }
+                (_, None) => {
+                    tree_moved = true;
+                    "deleted"
+                }
                 _ => "changed",
             };
             log(&format!("{label}: {}", state.rel(path)));
@@ -662,14 +672,14 @@ fn watch_loop(
         let just_moved = autofix_on && autofix(state);
         if just_moved {
             previous = snapshot(&state.root, &state.paths());
+            tree_moved = true;
         }
 
         let started = Instant::now();
+        let mut wrote = false;
         match state.pass(false) {
             Ok(changed) => {
-                if changed && nudge {
-                    nudge_sourcemap(&state.root);
-                }
+                wrote = changed;
                 log(&format!("regenerated in {} ms", started.elapsed().as_millis()))
             }
             // Uma pasta que acabou de nascer ainda nao esta no project file, e
@@ -689,6 +699,32 @@ fn watch_loop(
                 }
                 None => log(&format!("ERROR: {err:#}")),
             },
+        }
+
+        // Depois da pass, de proposito: a pass acabou de escrever as folhas, e
+        // uma folha nova e um no a mais na arvore. Refazer antes deixaria o
+        // sourcemap sem ela ate a proxima volta.
+        //
+        // Refazer quando a arvore muda nao e luxo, e o unico jeito de o mapa
+        // sobreviver a apagar uma pasta. Medido no Rojo 7.7.0: apagar uma pasta
+        // observada MATA o `rojo sourcemap --watch`, com
+        // `called Result::unwrap() on an Err value: Canonicalize` em
+        // change_processor.rs:179. O processo morre, o sourcemap.json congela
+        // no ultimo estado, e dali em diante nada mais entra nele — modulo novo
+        // nao aparece, apagado nao sai. E o "so volta se eu rodar o analyzer",
+        // porque o analyzer gera um sourcemap avulso, que nasce correto.
+        //
+        // Reagir so a mudanca do project file nao cobria: o rogen mapeia cada
+        // pasta de lado de feature como `$path`, entao mexer num modulo dentro
+        // de uma feature que ja existe nao reescreve o project file.
+        if nudge {
+            if forced || tree_moved {
+                if rebuild_sourcemap(&state.root) {
+                    log("sourcemap rebuilt");
+                }
+            } else if wrote {
+                nudge_sourcemap(&state.root);
+            }
         }
     }
 }
