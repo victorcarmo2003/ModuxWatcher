@@ -793,12 +793,16 @@ fn watch_loop(
         // Reagir so a mudanca do project file nao cobria: o rogen mapeia cada
         // pasta de lado de feature como `$path`, entao mexer num modulo dentro
         // de uma feature que ja existe nao reescreve o project file.
-        if nudge && source.owns_sourcemap() {
-            if forced || tree_moved {
+        if nudge {
+            // Refazer so quando o sourcemap e derivado do project file. Tocar,
+            // sempre: o toque reescreve os mesmos bytes, entao nao atropela
+            // mapa de ninguem, e e o unico aviso que o language server escuta
+            // quando so o CORPO de uma folha mudou.
+            if (forced || tree_moved) && source.owns_sourcemap() {
                 if rebuild_sourcemap(&state.root) {
                     log("sourcemap rebuilt");
                 }
-            } else if wrote {
+            } else if wrote || forced || tree_moved {
                 nudge_sourcemap(&state.root);
             }
         }
