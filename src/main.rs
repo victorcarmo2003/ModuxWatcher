@@ -34,6 +34,14 @@ struct Cli {
     #[arg(long, short, global = true, value_name = "PATH")]
     project: Option<PathBuf>,
 
+    /// Take the instance tree from a sourcemap instead of default.project.json.
+    ///
+    /// For flows with no project file, such as a Studio-first sync tool that
+    /// emits its own sourcemap. The generator stops reading the project file
+    /// and stops rebuilding the sourcemap, because it is no longer the owner.
+    #[arg(long, global = true, value_name = "PATH")]
+    sourcemap: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -90,6 +98,50 @@ fn main() {
     }
 }
 
+/// De onde vem a arvore de instancias.
+///
+/// O project file descreve pastas e o gerador deduz o resto; o sourcemap ja
+/// vem resolvido. Os dois produzem o mesmo `Map` — ha teste comparando os dois
+/// caminho por caminho —, mas quem os mantem atualizados e diferente, e por
+/// isso a fonte precisa viajar junto: o project file e reescrito pelo rogen e
+/// o sourcemap pertence a quem o emite.
+#[derive(Clone)]
+enum Source {
+    Project(PathBuf),
+    Sourcemap(PathBuf),
+}
+
+impl Source {
+    fn from(cli: &Cli, root: &Path) -> Self {
+        match &cli.sourcemap {
+            Some(p) if p.is_absolute() => Source::Sourcemap(p.clone()),
+            Some(p) => Source::Sourcemap(root.join(p)),
+            None => Source::Project(root.join(PROJECT)),
+        }
+    }
+
+    fn file(&self) -> &Path {
+        match self {
+            Source::Project(p) | Source::Sourcemap(p) => p,
+        }
+    }
+
+    fn read(&self) -> Result<Map> {
+        match self {
+            Source::Project(p) => Map::read(p),
+            Source::Sourcemap(p) => Map::from_sourcemap(p),
+        }
+    }
+
+    /// Refazer o sourcemap so faz sentido quando ele e derivado do project
+    /// file. Quando ELE e a fonte, quem o mantem e outro processo, e chamar o
+    /// rojo aqui sobrescreveria o mapa alheio com um vindo de um project file
+    /// que talvez nem exista.
+    fn owns_sourcemap(&self) -> bool {
+        matches!(self, Source::Project(_))
+    }
+}
+
 fn run(cli: &Cli) -> Result<()> {
     match &cli.command {
         Command::Extract { file } => {
@@ -99,7 +151,8 @@ fn run(cli: &Cli) -> Result<()> {
         }
         Command::Generate => {
             let root = project_root(cli)?;
-            let mut state = State::new(&root)?;
+            let source = Source::from(cli, &root);
+            let mut state = State::new(&root, &source)?;
             let started = Instant::now();
             let changed = state.pass(true)?;
             if !changed {
@@ -110,7 +163,8 @@ fn run(cli: &Cli) -> Result<()> {
         }
         Command::Check => {
             let root = project_root(cli)?;
-            let mut state = State::new(&root)?;
+            let source = Source::from(cli, &root);
+            let mut state = State::new(&root, &source)?;
             let stale = state.check_stale()?;
             if stale.is_empty() {
                 log("up to date");
@@ -126,7 +180,8 @@ fn run(cli: &Cli) -> Result<()> {
         }
         Command::List => {
             let root = project_root(cli)?;
-            let mut state = State::new(&root)?;
+            let source = Source::from(cli, &root);
+            let mut state = State::new(&root, &source)?;
             for m in state.modules()? {
                 // What the module declared, not what it was seen using. The
                 // inferred `dependencies` only covers reads inside a declared
@@ -143,11 +198,13 @@ fn run(cli: &Cli) -> Result<()> {
         }
         Command::Fix { dry_run, open } => {
             let root = project_root(cli)?;
-            fix(&root, *dry_run, *open)
+            let source = Source::from(cli, &root);
+            fix(&root, &source, *dry_run, *open)
         }
         Command::Watch { interval, fix: autofix_on, nudge } => {
             let root = project_root(cli)?;
-            let mut state = State::new(&root)?;
+            let source = Source::from(cli, &root);
+            let mut state = State::new(&root, &source)?;
             let started = Instant::now();
             if !state.pass(true)? {
                 log("up to date");
@@ -161,12 +218,29 @@ fn run(cli: &Cli) -> Result<()> {
                     ));
                 }
             }
-            watch_loop(&mut state, Duration::from_millis(*interval), *autofix_on, *nudge)
+            watch_loop(&mut state, &source, Duration::from_millis(*interval), *autofix_on, *nudge)
         }
     }
 }
 
 fn project_root(cli: &Cli) -> Result<PathBuf> {
+    // Com --sourcemap nao ha project file para procurar, e exigir um seria o
+    // contrario do que a flag existe para permitir. A raiz passa a ser a pasta
+    // que contem o sourcemap, porque os caminhos dentro dele sao relativos a
+    // ela.
+    if let Some(mapa) = &cli.sourcemap {
+        if let Some(p) = &cli.project {
+            return Ok(p.clone());
+        }
+        if !mapa.exists() {
+            bail!("{} not found", mapa.display());
+        }
+        return match mapa.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(p) => Ok(p.to_path_buf()),
+            None => std::env::current_dir().context("could not read the current directory"),
+        };
+    }
+
     if let Some(p) = &cli.project {
         if !p.join(PROJECT).exists() {
             bail!("{} has no {PROJECT}", p.display());
@@ -181,7 +255,8 @@ fn project_root(cli: &Cli) -> Result<PathBuf> {
         if !current.pop() {
             bail!(
                 "{PROJECT} not found here or in any parent directory.\n\
-                 Rode inside do project, ou passe --project PATH."
+                 Run this inside the project, pass --project PATH, or use \
+                 --sourcemap PATH when there is no project file."
             );
         }
     }
@@ -241,8 +316,8 @@ fn loose_modules(root: &Path, state: &State) -> Vec<PathBuf> {
         .collect()
 }
 
-fn fix(root: &Path, dry_run: bool, open: bool) -> Result<()> {
-    let state = State::new(root)?;
+fn fix(root: &Path, source: &Source, dry_run: bool, open: bool) -> Result<()> {
+    let state = State::new(root, source)?;
     let loose = loose_modules(root, &state);
 
     if loose.is_empty() {
@@ -361,10 +436,10 @@ struct State {
 }
 
 impl State {
-    fn new(root: &Path) -> Result<Self> {
+    fn new(root: &Path, source: &Source) -> Result<Self> {
         Ok(Self {
             root: root.to_path_buf(),
-            map: Map::read(&root.join(PROJECT))?,
+            map: source.read()?,
             targets: manifest::targets(root),
             module_lists: manifest::module_lists(root),
             cache: BTreeMap::new(),
@@ -603,14 +678,15 @@ fn nudge_sourcemap(root: &Path) {
 
 fn watch_loop(
     state: &mut State,
+    source: &Source,
     interval: Duration,
     autofix_on: bool,
     nudge: bool,
 ) -> Result<()> {
     log(&format!("watching {}/ (Ctrl+C to stop)", SOURCE));
     let mut previous = snapshot(&state.root, &state.paths());
-    let project = state.root.join(PROJECT);
-    let mut project_at = State::signature(&project);
+    let origem = source.file().to_path_buf();
+    let mut origem_at = State::signature(&origem);
 
     loop {
         std::thread::sleep(interval);
@@ -620,18 +696,18 @@ fn watch_loop(
         // com o mapa velho ate ser reiniciado, errando `path outside
         // default.project.json` para sempre. E o snapshot nao ajudava: ele
         // varre src/, e o project file mora na raiz.
-        let now = State::signature(&project);
+        let now = State::signature(&origem);
         let mut forced = false;
-        if now != project_at {
-            project_at = now;
-            match Map::read(&project) {
+        if now != origem_at {
+            origem_at = now;
+            match source.read() {
                 Ok(map) => {
                     state.map = map;
                     state.cache.clear();
-                    log("project file changed, reloaded");
+                    log(&format!("{} changed, reloaded", state.rel(&origem)));
                     forced = true;
                 }
-                Err(err) => log(&format!("ERROR: could not reload the project file: {err:#}")),
+                Err(err) => log(&format!("ERROR: could not reload {}: {err:#}", state.rel(&origem))),
             }
         }
 
@@ -717,7 +793,7 @@ fn watch_loop(
         // Reagir so a mudanca do project file nao cobria: o rogen mapeia cada
         // pasta de lado de feature como `$path`, entao mexer num modulo dentro
         // de uma feature que ja existe nao reescreve o project file.
-        if nudge {
+        if nudge && source.owns_sourcemap() {
             if forced || tree_moved {
                 if rebuild_sourcemap(&state.root) {
                     log("sourcemap rebuilt");
