@@ -29,17 +29,29 @@ pub fn span<T: Node + Display>(node: &T) -> String {
     let full = node.to_string();
     let tokens: Vec<_> = node.tokens().collect();
 
-    let lead: usize = tokens
-        .first()
-        .map(|t| t.leading_trivia().map(|x| x.to_string().len()).sum())
-        .unwrap_or(0);
-    let trail: usize = tokens
-        .last()
-        .map(|t| t.trailing_trivia().map(|x| x.to_string().len()).sum())
-        .unwrap_or(0);
+    let joined = |trivia: &mut dyn Iterator<Item = String>| -> String { trivia.collect() };
 
-    let start = lead.min(full.len());
-    let end = full.len().saturating_sub(trail).max(start);
-    full[start..end].trim().to_string()
+    let lead = tokens
+        .first()
+        .map(|t| joined(&mut t.leading_trivia().map(|x| x.to_string())))
+        .unwrap_or_default();
+    let trail = tokens
+        .last()
+        .map(|t| joined(&mut t.trailing_trivia().map(|x| x.to_string())))
+        .unwrap_or_default();
+
+    // Cortar por comprimento seria errado sempre que o render terminar em algo
+    // que nao e o ultimo token: um table type fecha com `}` que nao aparece em
+    // `tokens()`, entao descontar o tamanho da trivia comia a chave e
+    // `{ string }` virava `{ string`, que nao e Luau. Descontar so quando a
+    // trivia esta mesmo na borda cobre os dois casos.
+    let start = if !lead.is_empty() && full.starts_with(&lead) { lead.len() } else { 0 };
+    let end = if !trail.is_empty() && full.ends_with(&trail) {
+        full.len() - trail.len()
+    } else {
+        full.len()
+    };
+
+    full[start..end.max(start)].trim().to_string()
 }
 

@@ -83,6 +83,24 @@ fn string_value(expr: &Expression) -> Option<String> {
     })
 }
 
+/// Os parametros do metodo, com o tipo que a pessoa ja declarou na assinatura.
+/// Serve para `self.Campo = parametro`, que e a forma mais comum de encher o
+/// self e antes era descartada: o gerador so lia literal, e pedia um `::`
+/// redundante logo ao lado de uma anotacao que ja existia dois palmos acima.
+fn typed_parameters(body: &FunctionBody) -> BTreeMap<String, String> {
+    let params: Vec<&Parameter> = body.parameters().iter().collect();
+    let types: Vec<_> = body.type_specifiers().collect();
+
+    let mut out = BTreeMap::new();
+    for (i, p) in params.iter().enumerate() {
+        let Parameter::Name(_) = p else { continue };
+        if let Some(ts) = types.get(i).copied().flatten() {
+            out.insert(param_name(p), span(ts.type_info()));
+        }
+    }
+    out
+}
+
 fn param_name(p: &Parameter) -> String {
     match p {
         Parameter::Name(t) => name_of(t),
@@ -218,7 +236,17 @@ impl Extractor {
         });
     }
 
-    fn value_type(&mut self, value: &Expression, where_at: &str) -> Option<String> {
+    fn value_type(
+        &mut self,
+        value: &Expression,
+        where_at: &str,
+        known: &BTreeMap<String, String>,
+    ) -> Option<String> {
+        if let Expression::Var(Var::Name(name)) = value {
+            if let Some(ty) = known.get(&name_of(name)) {
+                return Some(ty.clone());
+            }
+        }
         match value {
             Expression::TypeAssertion { type_assertion, .. } => {
                 return Some(span(type_assertion.cast_to()))
@@ -299,6 +327,7 @@ impl Extractor {
             let signature = self.signature(&body, colon, true);
             methods.push(Method { name, signature });
 
+            let params = typed_parameters(&body);
             let mut scan = BodyScan::default();
             body.block().visit(&mut scan);
             deps.extend(scan.deps);
@@ -306,7 +335,7 @@ impl Extractor {
                 if fields.contains_key(&field) {
                     continue;
                 }
-                if let Some(ty) = self.value_type(&value, &format!("self.{field}")) {
+                if let Some(ty) = self.value_type(&value, &format!("self.{field}"), &params) {
                     fields.insert(field, ty);
                 }
             }
