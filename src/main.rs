@@ -559,6 +559,26 @@ fn snapshot(root: &Path, targets: &[PathBuf]) -> BTreeMap<PathBuf, Signature> {
 /// fica sem o aviso que ele de fato escuta. O arquivo tem alguns KB, e um write
 /// e o evento mais barato que o alcanca. Nao ha risco de laco: o rojo observa o
 /// project file e as fontes, nunca o sourcemap que ele mesmo emite.
+/// Regera o sourcemap chamando o rojo.
+///
+/// O `rojo sourcemap --watch` le o default.project.json uma vez, na partida, e
+/// nunca mais. Renomear uma pasta muda a arvore, o rogen reescreve o project
+/// file, e o watch do rojo segue observando a arvore velha: o sourcemap
+/// congela e o language server passa a resolver caminhos que nao existem mais.
+/// Medido num projeto real, com o sourcemap vinte minutos atras do disco.
+///
+/// Falhar aqui nao e motivo para derrubar nada: sem o rojo no PATH, o estado
+/// volta a ser o de antes.
+fn rebuild_sourcemap(root: &Path) -> bool {
+    std::process::Command::new("rojo")
+        .current_dir(root)
+        .args(["sourcemap", PROJECT, "-o", "sourcemap.json"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 fn nudge_sourcemap(root: &Path) {
     let path = root.join("sourcemap.json");
     let Ok(text) = std::fs::read_to_string(&path) else { return };
@@ -600,7 +620,15 @@ fn watch_loop(
                 Ok(map) => {
                     state.map = map;
                     state.cache.clear();
-                    log("project file changed, reloaded");
+                    // A arvore mudou, entao o sourcemap que o rojo mantem ficou
+                    // para tras. Regerar aqui e o unico ponto do fluxo que sabe
+                    // que isso aconteceu.
+                    let redone = nudge && rebuild_sourcemap(&state.root);
+                    log(if redone {
+                        "project file changed, reloaded and sourcemap rebuilt"
+                    } else {
+                        "project file changed, reloaded"
+                    });
                     forced = true;
                 }
                 Err(err) => log(&format!("ERROR: could not reload the project file: {err:#}")),
