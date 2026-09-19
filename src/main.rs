@@ -616,7 +616,16 @@ fn watch_loop(state: &mut State, interval: Duration, autofix_on: bool) -> Result
             Err(err) if just_moved && format!("{err:#}").contains("outside") => {
                 log("waiting for rogen to pick up the new folder")
             }
-            Err(err) => log(&format!("ERROR: {err:#}")),
+            // Sintaxe incompleta enquanto se digita nao e falha do projeto: o
+            // leaf anterior continua no lugar e a proxima pass resolve. Uma
+            // linha basta; o dump do parser so afogaria o log.
+            Err(err) => match err.downcast_ref::<ast::Syntax>() {
+                Some(broken) => {
+                    let at = broken.line.map(|n| format!(":{n}")).unwrap_or_default();
+                    log(&format!("incomplete: {}{at}", state.rel(&broken.file)))
+                }
+                None => log(&format!("ERROR: {err:#}")),
+            },
         }
     }
 }

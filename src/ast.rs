@@ -1,9 +1,38 @@
 use std::fmt::Display;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use full_moon::ast::Ast;
 use full_moon::node::Node;
+
+/// Um arquivo a meio caminho de ser escrito nao e uma falha do projeto, e o
+/// watch precisa saber a diferenca: la isso acontece a cada tecla, e o dump do
+/// full_moon, com tres erros de duas linhas cada, enterra todo o resto do log.
+/// Fora do watch a mensagem inteira e o que interessa, entao ela viaja junto.
+#[derive(Debug)]
+pub struct Syntax {
+    pub file: PathBuf,
+    pub line: Option<usize>,
+    pub detail: String,
+}
+
+impl Display for Syntax {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:\n  {}", self.file.display(), self.detail)
+    }
+}
+
+impl std::error::Error for Syntax {}
+
+fn first_line(message: &str) -> Option<usize> {
+    let at = message.find("line ")? + "line ".len();
+    message[at..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
 
 pub fn parse(path: &Path) -> Result<Ast> {
     let text = std::fs::read_to_string(path)
@@ -13,7 +42,11 @@ pub fn parse(path: &Path) -> Result<Ast> {
         .into_result()
         .map_err(|errors| {
             let shown: Vec<String> = errors.iter().take(3).map(ToString::to_string).collect();
-            anyhow::anyhow!("{}:\n  {}", path.display(), shown.join("\n  "))
+            anyhow::Error::from(Syntax {
+                line: shown.first().and_then(|m| first_line(m)),
+                file: path.to_path_buf(),
+                detail: shown.join("\n  "),
+            })
         })
 }
 
