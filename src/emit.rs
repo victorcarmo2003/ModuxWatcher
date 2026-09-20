@@ -44,7 +44,7 @@ fn reindent(text: &str, at: &str) -> String {
 ///
 /// Ate 0.6.11 isto era um `script` -> `script.Parent`: a folha morava dentro da
 /// pasta do modulo, entao subir um nivel dava exatamente a instancia do modulo.
-/// Com a folha em `Types/<lado>/<Id>.luau` nao existe mais relacao relativa
+/// Com a folha em `ModuxTypes/<lado>/<Id>.luau` nao existe mais relacao relativa
 /// entre as duas, e um require relativo passa a apontar para dentro de
 /// `Types/` — foi o que a bancada mostrou:
 ///

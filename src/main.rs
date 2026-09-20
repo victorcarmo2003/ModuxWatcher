@@ -295,7 +295,7 @@ fn project_root(cli: &Cli) -> Result<PathBuf> {
 /// Ate 0.6.11 esta funcao fazia o CONTRARIO, e por um motivo que deixou de
 /// existir: a folha de tipo era escrita ao lado do modulo, entao dois modulos
 /// soltos na mesma pasta disputavam o mesmo `Type.luau` e a pasta propria era
-/// a unica saida. Desde a 0.7.0 a folha mora em `Types/<lado>/<Id>.luau`,
+/// a unica saida. Desde a 0.7.0 a folha mora em `ModuxTypes/<lado>/<Id>.luau`,
 /// endereçada por ID, e a pasta perdeu a razao de ser: uma pasta cujo unico
 /// conteudo e o `init.luau` so acrescenta um nivel na arvore.
 ///
@@ -402,7 +402,8 @@ fn fix(root: &Path, source: &Source, layout: manifest::Layout, dry_run: bool, op
     let foldered = foldered_modules(root, &state);
     let legacy = legacy_leaves(root, &state);
 
-    if foldered.is_empty() && legacy.is_empty() {
+    let antiga_existe = root.join(&state.layout.source).join("Types").is_dir();
+    if foldered.is_empty() && legacy.is_empty() && !antiga_existe {
         log("every module is already a file of its own");
         return Ok(());
     }
@@ -432,6 +433,17 @@ fn fix(root: &Path, source: &Source, layout: manifest::Layout, dry_run: bool, op
         }
     }
 
+    // Pasta `Types/` da 0.7.0/0.7.1, antes do nome mudar para `ModuxTypes/`
+    // (ver Layout::types_dirs: `src/Types/shared` caia em cima de
+    // `src/Shared/Types` do framework). Tudo la dentro e output do gerador.
+    let antiga = root.join(&state.layout.source).join("Types");
+    if antiga.is_dir() {
+        match std::fs::remove_dir_all(&antiga) {
+            Ok(()) => log(&format!("pasta {} da 0.7.0/0.7.1 removida", state.rel(&antiga))),
+            Err(err) => log(&format!("could not remove {}: {err:#}", state.rel(&antiga))),
+        }
+    }
+
     // Depois dos flattens: um modulo achatado ja levou a sua folha junto, e o
     // que sobra aqui e de quem manteve a pasta.
     for leaf in legacy_leaves(root, &state) {
@@ -442,7 +454,7 @@ fn fix(root: &Path, source: &Source, layout: manifest::Layout, dry_run: bool, op
     }
 
     log("run `modux generate` to write the leaves in their new place,");
-    log("then `rogen build` again so Types/ enters the project file");
+    log("then `rogen build` again so ModuxTypes/ enters the project file");
     Ok(())
 }
 
@@ -609,7 +621,87 @@ impl State {
         Ok(true)
     }
 
-    /// Remove de `Types/` toda folha sem modulo correspondente. Devolve se
+    /// Recusa escrever uma folha que ocuparia o caminho de DataModel de outro
+    /// arquivo.
+    ///
+    /// O rogen mapeia `src/<Feature>/<lado>` para `<Raiz>.<lado>.<Feature>`, e
+    /// duas pastas de disco diferentes podem cair no MESMO caminho. Quando
+    /// isso acontece ele desce para entradas por arquivo e mescla as duas — nao
+    /// da erro. O resultado e pior que erro: se os dois lados tiverem um
+    /// arquivo de mesmo nome, um simplesmente SOME do project file, e quem
+    /// requer aquele caminho passa a receber o outro.
+    ///
+    /// Foi por isso que a pasta gerada deixou de se chamar `Types` (ver
+    /// `Layout::types_dirs`), mas trocar o nome so resolve a colisao que eu
+    /// conhecia. Esta guarda cobre as que eu nao conheco: qualquer arquivo do
+    /// projeto que por acaso divida o caminho com uma folha.
+    fn check_leaf_collisions(
+        &self,
+        modules: &[Module],
+        sides: &std::collections::BTreeMap<String, rojo::Side>,
+    ) -> Result<()> {
+        let dirs: Vec<PathBuf> = self.layout.types_dirs.iter().map(|(_, p)| p.clone()).collect();
+        let dentro = |p: &Path| dirs.iter().any(|d| p.starts_with(d));
+
+        // O caminho de DataModel de CADA pasta de folha, deduzido de uma folha
+        // que ja esteja no mapa. Nao da para perguntar pela pasta direto: o
+        // `Map` casa por prefixo contra o project file, e o rogen so registra
+        // caminho de arquivo quando duas pastas se fundem.
+        let mut raizes: Vec<(String, PathBuf)> = Vec::new();
+        for m in modules {
+            let leaf = emit::leaf_path(&self.layout, sides[&m.id], &m.id);
+            let Ok(dm) = self.map.path(&leaf) else { continue };
+            let Some(pai) = dm.rsplit_once('.').map(|(a, _)| a.to_string()) else { continue };
+            let Some(dir) = leaf.parent().map(Path::to_path_buf) else { continue };
+            if !raizes.iter().any(|(p, _)| *p == pai) {
+                raizes.push((pai, dir));
+            }
+        }
+
+        // Um arquivo QUE NAO E FOLHA caindo debaixo de uma dessas raizes
+        // significa que duas pastas de disco viraram a mesma instancia.
+        //
+        // Reparar no arquivo perdido nao funcionaria: quando duas pastas se
+        // fundem e ha nome repetido, o perdedor SOME do project file, entao
+        // `map.path` nem responde por ele. Quem denuncia a fusao sao os
+        // VIZINHOS dele, que continuam mapeados e agora dividem a raiz com as
+        // folhas.
+        for entry in WalkDir::new(self.root.join(&self.layout.source))
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+        {
+            let path = entry.path();
+            if !path.is_file() || path.extension().is_none_or(|e| e != "luau") {
+                continue;
+            }
+            // Relativizar ANTES de qualquer comparacao. WalkDir entrega
+            // caminho absoluto; `layout.types_dirs` e as entradas do project
+            // file sao relativas a raiz. Comparar absoluto com relativo nao da
+            // erro, so nunca casa — custou um falso negativo na guarda e um
+            // falso positivo na exclusao, cada um numa rodada diferente.
+            let relativo = path.strip_prefix(&self.root).unwrap_or(path);
+            if dentro(relativo) {
+                continue;
+            }
+            let Ok(dm) = self.map.path(relativo) else { continue };
+            for (raiz, dir) in &raizes {
+                if dm.starts_with(&format!("{raiz}.")) {
+                    bail!(
+                        "{} e {} viram a MESMA instancia ({}).\n  \
+                         Quando duas pastas se fundem e ha nome repetido, uma some \
+                         do project file sem aviso.\n  \
+                         Renomeie a pasta do projeto, ou o modulo.",
+                        self.rel(dir),
+                        self.rel(path),
+                        raiz
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove de `ModuxTypes/` toda folha sem modulo correspondente. Devolve se
     /// apagou alguma coisa.
     fn sweep_type_dirs(
         layout: &manifest::Layout,
@@ -671,6 +763,8 @@ impl State {
         }
 
         let sides = manifest::validate(&modules, &self.map)?;
+
+        self.check_leaf_collisions(&modules, &sides)?;
 
         for (_, data) in &pending_leaves {
             let leaf = emit::leaf_path(&self.layout, sides[&data.id], &data.id);

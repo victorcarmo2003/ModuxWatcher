@@ -44,7 +44,7 @@ impl Layout {
             .iter()
             .find(|(s, _)| *s == side)
             .map(|(_, p)| p.clone())
-            .unwrap_or_else(|| self.source.join("Types").join(side.name()))
+            .unwrap_or_else(|| self.source.join("ModuxTypes").join(side.name()))
     }
 }
 
@@ -61,13 +61,23 @@ impl Layout {
                 (Side::Client, source.join("Modux/client/Modules.luau")),
                 (Side::Server, source.join("Modux/server/Modules.luau")),
             ],
-            // Uma "feature" chamada Types, com um lado cada: e exatamente a
-            // convencao que o rogen ja traduz (`src/<Feature>/<lado>/`), entao
-            // o mapeamento para os servicos sai de graca, sem tocar no rogen.
+            // Uma "feature" com um lado cada: e a convencao que o rogen ja
+            // traduz (`src/<Feature>/<lado>/` -> `<Raiz>.<lado>.<Feature>`),
+            // entao o mapeamento para os servicos sai de graca, sem tocar no
+            // rogen.
+            //
+            // O nome e `ModuxTypes`, nao `Types`, e isso NAO e preferencia:
+            // `src/Types/shared` traduziria para `ReplicatedStorage.shared.Types`,
+            // exatamente onde mora `src/Shared/Types/` do framework (Atomic,
+            // Occlude, Struct, Union). O rogen resolve a sobreposicao descendo
+            // para entradas por arquivo, entao nao ha erro — mas um modulo
+            // shared chamado `Union` passa a ocupar o caminho da type function
+            // `Union` e a do framework SOME do project file, em silencio.
+            // Reproduzido antes de trocar o nome.
             types_dirs: vec![
-                (Side::Client, source.join("Types/client")),
-                (Side::Server, source.join("Types/server")),
-                (Side::Shared, source.join("Types/shared")),
+                (Side::Client, source.join("ModuxTypes/client")),
+                (Side::Server, source.join("ModuxTypes/server")),
+                (Side::Shared, source.join("ModuxTypes/shared")),
             ],
             libs_dir: source.join("Libs"),
             libs_target: source.join("Modux/shared/Libs.luau"),
@@ -90,9 +100,9 @@ impl Layout {
                 (Side::Server, server.join("Modux/Modules.luau")),
             ],
             types_dirs: vec![
-                (Side::Client, client.join("Types")),
-                (Side::Server, server.join("Types")),
-                (Side::Shared, shared.join("Types")),
+                (Side::Client, client.join("ModuxTypes")),
+                (Side::Server, server.join("ModuxTypes")),
+                (Side::Shared, shared.join("ModuxTypes")),
             ],
             libs_dir: shared.join("Libs"),
             libs_target: shared.join("Modux/Libs.luau"),
@@ -123,7 +133,7 @@ pub fn validate(modules: &[Module], map: &Map) -> Result<BTreeMap<String, Side>>
     // silencio, e o Manifest passava a apontar dois IDs para a folha de um
     // so — um modulo com os metodos do outro, tipo errado em vez de ausente.
     //
-    // Desde a 0.7.0 a folha e enderecada por ID (`Types/<lado>/<Id>.luau`,
+    // Desde a 0.7.0 a folha e enderecada por ID (`ModuxTypes/<lado>/<Id>.luau`,
     // ver `Layout::types_dirs`), e o bail de ID duplicado logo acima ja torna
     // a colisao impossivel: dois IDs diferentes nunca produzem o mesmo
     // caminho. A checagem saiu junto com o motivo dela existir.
