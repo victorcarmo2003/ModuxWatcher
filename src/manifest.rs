@@ -22,8 +22,30 @@ pub struct Layout {
     pub source: PathBuf,
     pub targets: Vec<(Side, PathBuf)>,
     pub module_lists: Vec<(Side, PathBuf)>,
+    /// Onde as folhas de tipo vivem, uma pasta por lado.
+    ///
+    /// Ate 0.6.11 a folha era escrita ao LADO do modulo (`Foo/Type.luau`), e
+    /// era so por isso que todo modulo precisava de uma pasta propria: dois
+    /// modulos soltos na mesma pasta disputariam o mesmo `Type.luau`. O id ja
+    /// e unico no projeto inteiro (ha um bail para duplicata), entao enderecar
+    /// a folha por id em vez de por diretorio remove a colisao na raiz — e com
+    /// ela a obrigacao da pasta. O modulo volta a poder ser um arquivo solto.
+    ///
+    /// O lado entra no caminho por REPLICACAO, nao por unicidade: a folha de um
+    /// Controller precisa chegar ao cliente, a de um Service nao pode.
+    pub types_dirs: Vec<(Side, PathBuf)>,
     pub libs_dir: PathBuf,
     pub libs_target: PathBuf,
+}
+
+impl Layout {
+    pub fn types_dir(&self, side: Side) -> PathBuf {
+        self.types_dirs
+            .iter()
+            .find(|(s, _)| *s == side)
+            .map(|(_, p)| p.clone())
+            .unwrap_or_else(|| self.source.join("Types").join(side.name()))
+    }
 }
 
 impl Layout {
@@ -38,6 +60,14 @@ impl Layout {
             module_lists: vec![
                 (Side::Client, source.join("Modux/client/Modules.luau")),
                 (Side::Server, source.join("Modux/server/Modules.luau")),
+            ],
+            // Uma "feature" chamada Types, com um lado cada: e exatamente a
+            // convencao que o rogen ja traduz (`src/<Feature>/<lado>/`), entao
+            // o mapeamento para os servicos sai de graca, sem tocar no rogen.
+            types_dirs: vec![
+                (Side::Client, source.join("Types/client")),
+                (Side::Server, source.join("Types/server")),
+                (Side::Shared, source.join("Types/shared")),
             ],
             libs_dir: source.join("Libs"),
             libs_target: source.join("Modux/shared/Libs.luau"),
@@ -58,6 +88,11 @@ impl Layout {
             module_lists: vec![
                 (Side::Client, client.join("Modux/Modules.luau")),
                 (Side::Server, server.join("Modux/Modules.luau")),
+            ],
+            types_dirs: vec![
+                (Side::Client, client.join("Types")),
+                (Side::Server, server.join("Types")),
+                (Side::Shared, shared.join("Types")),
             ],
             libs_dir: shared.join("Libs"),
             libs_target: shared.join("Modux/Libs.luau"),
@@ -82,27 +117,16 @@ pub fn validate(modules: &[Module], map: &Map) -> Result<BTreeMap<String, Side>>
         }
     }
 
-    // Dois modulos na mesma pasta escreveriam o mesmo Type.luau, e o segundo
-    // sobrescreve o primeiro sem reclamar. O Manifest fica apontando os dois
-    // IDs para a folha de um so, entao um modulo passa a ter os metodos do
-    // outro e o erro nao aparece em lugar nenhum: o tipo esta errado, nao
-    // ausente. Por isso isto e um bail, nao um warning.
-    let mut leaves: BTreeMap<PathBuf, &Module> = BTreeMap::new();
-    for m in modules {
-        let leaf = crate::emit::leaf_path(Path::new(&m.file));
-        if let Some(previous) = leaves.insert(leaf.clone(), m) {
-            let shown = leaf.to_string_lossy().replace('\\', "/");
-            bail!(
-                "{} and {} would both write {}.\n  \
-                 A module needs a folder of its own, with the code in init.luau, \
-                 because the type leaf is written beside it.\n  \
-                 Run `modux fix` to move each one into its own folder.",
-                previous.file,
-                m.file,
-                shown
-            );
-        }
-    }
+    // Aqui existia uma checagem de colisao de folha: enquanto a folha era
+    // escrita AO LADO do modulo, dois modulos soltos na mesma pasta
+    // disputavam o mesmo `Type.luau`, o segundo sobrescrevia o primeiro em
+    // silencio, e o Manifest passava a apontar dois IDs para a folha de um
+    // so — um modulo com os metodos do outro, tipo errado em vez de ausente.
+    //
+    // Desde a 0.7.0 a folha e enderecada por ID (`Types/<lado>/<Id>.luau`,
+    // ver `Layout::types_dirs`), e o bail de ID duplicado logo acima ja torna
+    // a colisao impossivel: dois IDs diferentes nunca produzem o mesmo
+    // caminho. A checagem saiu junto com o motivo dela existir.
 
     let mut sides: BTreeMap<String, Side> = BTreeMap::new();
     for m in modules {
@@ -148,6 +172,7 @@ pub fn emit(
     modules: &[Module],
     sides: &BTreeMap<String, Side>,
     map: &Map,
+    layout: &Layout,
 ) -> Result<Option<String>> {
     let visible: Vec<&Module> = modules
         .iter()
@@ -159,7 +184,7 @@ pub fn emit(
     let mut paths = vec![
     ];
     for m in &visible {
-        let leaf = crate::emit::leaf_path(Path::new(&m.file));
+        let leaf = crate::emit::leaf_path(layout, sides[&m.id], &m.id);
         paths.push((m.id.clone(), map.path(&leaf)?));
     }
 

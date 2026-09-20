@@ -1,7 +1,9 @@
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::extract::Module;
+use crate::manifest::Layout;
+use crate::rojo::Side;
 
 /// A type annotation is transcribed from the source verbatim, so a multi-line
 /// one arrives carrying whatever indentation it had where it was written. An
@@ -38,12 +40,37 @@ fn reindent(text: &str, at: &str) -> String {
     out
 }
 
-pub fn rewrite_require(expr: &str) -> String {
-    if expr == "script" || expr.starts_with("script.") {
-        format!("script.Parent{}", &expr["script".len()..])
-    } else {
-        expr.to_string()
+/// Traduz um require do MODULO para o mesmo alvo visto de dentro da folha.
+///
+/// Ate 0.6.11 isto era um `script` -> `script.Parent`: a folha morava dentro da
+/// pasta do modulo, entao subir um nivel dava exatamente a instancia do modulo.
+/// Com a folha em `Types/<lado>/<Id>.luau` nao existe mais relacao relativa
+/// entre as duas, e um require relativo passa a apontar para dentro de
+/// `Types/` — foi o que a bancada mostrou:
+///
+///     Unknown require: game/ServerScriptService/server/Types/Template
+///
+/// E o erro nao para ai: um require quebrado vira `*error-type*`, que envenena
+/// as type functions que consomem a folha e reaparece como falha em modulos
+/// que nao tem nada de errado.
+///
+/// Por isso o require vira ABSOLUTO, ancorado no caminho de DataModel do
+/// proprio modulo, com `.Parent` resolvido sobre os segmentos. Mesmo
+/// enderecamento que o Manifest ja usa; quem chama declara o `game:GetService`
+/// da raiz.
+pub fn rewrite_require(expr: &str, module_path: &str) -> String {
+    if expr != "script" && !expr.starts_with("script.") {
+        return expr.to_string();
     }
+    let mut segs: Vec<&str> = module_path.split('.').filter(|s| !s.is_empty()).collect();
+    for part in expr.split('.').skip(1) {
+        if part == "Parent" {
+            segs.pop();
+        } else {
+            segs.push(part);
+        }
+    }
+    segs.join(".")
 }
 
 fn cites(texts: &[String], name: &str) -> bool {
@@ -103,11 +130,16 @@ fn cites_alias(texts: &[String], alias: &str) -> bool {
     })
 }
 
-pub fn leaf_path(origin: &Path) -> PathBuf {
-    origin.parent().unwrap_or(Path::new(".")).join("Type.luau")
+/// Onde a folha de tipo de um modulo e escrita.
+///
+/// Endereca por ID, nao por diretorio de origem (ver `Layout::types_dirs`): o
+/// ID ja e unico no projeto, entao a folha nunca colide, e o modulo deixa de
+/// precisar de uma pasta so para ter onde guarda-la.
+pub fn leaf_path(layout: &Layout, side: Side, id: &str) -> PathBuf {
+    layout.types_dir(side).join(format!("{id}.luau"))
 }
 
-pub fn emit(m: &Module) -> String {
+pub fn emit(m: &Module, module_path: &str) -> String {
     let mut members: Vec<(String, String)> = Vec::new();
 
     // A component object always has the Instance it was built for, so `Public`
@@ -148,7 +180,7 @@ pub fn emit(m: &Module) -> String {
     // come along. `target` is the members plus every local type that was taken.
     let requires: Vec<_> = m.requires.iter().filter(|r| cites_alias(&target, &r.alias)).collect();
 
-    let exprs: Vec<String> = requires.iter().map(|r| rewrite_require(&r.expr)).collect();
+    let exprs: Vec<String> = requires.iter().map(|r| rewrite_require(&r.expr, module_path)).collect();
     let services: Vec<_> = m
         .services
         .iter()
@@ -163,6 +195,21 @@ pub fn emit(m: &Module) -> String {
             "local {} = game:GetService(\"{}\")",
             s.alias, s.service
         ));
+    }
+    // Raizes que nasceram da absolutizacao acima e que o modulo nao declarava
+    // como servico proprio: o require agora comeca no nome do servico, e sem o
+    // `local` correspondente a folha nao compila.
+    let ja: Vec<&str> = services.iter().map(|s| s.alias.as_str()).collect();
+    let mut extras: Vec<&str> = Vec::new();
+    for e in &exprs {
+        let root = e.split('.').next().unwrap_or_default();
+        if root.is_empty() || ja.contains(&root) || extras.contains(&root) {
+            continue;
+        }
+        extras.push(root);
+    }
+    for root in &extras {
+        header.push(format!("local {root} = game:GetService(\"{root}\")"));
     }
     for (i, r) in requires.iter().enumerate() {
         header.push(format!("local {} = require({})", r.alias, exprs[i]));

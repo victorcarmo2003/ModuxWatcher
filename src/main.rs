@@ -62,7 +62,7 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_INTERVAL_MS)]
         interval: u64,
 
-        /// Move a newly created loose module into its own folder and reopen it.
+        /// Flatten a newly created `Foo/init.luau` into `Foo.luau` and reopen it.
         #[arg(long)]
         fix: bool,
 
@@ -77,7 +77,7 @@ enum Command {
     /// Print every module found, with its id, kind and side.
     List,
 
-    /// Move every module that is a loose file into a folder of its own.
+    /// Flatten every module that still lives alone inside a folder of its own.
     Fix {
         /// Report what would move, without touching anything.
         #[arg(long)]
@@ -239,10 +239,10 @@ fn run(cli: &Cli) -> Result<()> {
             }
             log(&format!("primeira pass em {} ms", started.elapsed().as_millis()));
             if *autofix_on {
-                let loose = loose_modules(&root, &state).len();
-                if loose > 0 {
+                let foldered = foldered_modules(&root, &state).len();
+                if foldered > 0 {
                     log(&format!(
-                        "{loose} module(s) already loose; run `modux fix` for those.                          From here on, a new one is moved as it appears"
+                        "{foldered} module(s) still in a folder of their own; run `modux fix` for those.                          From here on, a new one is flattened as it appears"
                     ));
                 }
             }
@@ -290,39 +290,64 @@ fn project_root(cli: &Cli) -> Result<PathBuf> {
     }
 }
 
-/// A module written as `Foo.luau` puts its type leaf in the parent folder, where
-/// it collides with every other loose module beside it. Moving the code to
-/// `Foo/init.luau` fixes that, and it is safe: Rojo turns a folder with an
-/// init.luau into a ModuleScript of the folder's name, so `script` and
-/// `script.Parent` keep pointing at exactly what they pointed at before. No
-/// require has to be rewritten.
-fn relocate(file: &Path, siblings: &[PathBuf]) -> Result<PathBuf> {
-    let stem = file
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .with_context(|| format!("{} has no usable name", file.display()))?;
-    let folder = file.with_file_name(stem);
-    let destination = folder.join("init.luau");
+/// Achata `Foo/init.luau` de volta em `Foo.luau`.
+///
+/// Ate 0.6.11 esta funcao fazia o CONTRARIO, e por um motivo que deixou de
+/// existir: a folha de tipo era escrita ao lado do modulo, entao dois modulos
+/// soltos na mesma pasta disputavam o mesmo `Type.luau` e a pasta propria era
+/// a unica saida. Desde a 0.7.0 a folha mora em `Types/<lado>/<Id>.luau`,
+/// endereçada por ID, e a pasta perdeu a razao de ser: uma pasta cujo unico
+/// conteudo e o `init.luau` so acrescenta um nivel na arvore.
+///
+/// A troca e segura nos dois sentidos, e pelo mesmo motivo: o Rojo transforma
+/// uma pasta com `init.luau` num ModuleScript com o nome da pasta, que e
+/// exatamente a mesma instancia que `Foo.luau` produz no mesmo pai. `script` e
+/// `script.Parent` continuam apontando para onde apontavam. Nenhum require
+/// precisa ser reescrito.
+///
+/// So achata quando a pasta nao tem mais nada dentro alem do `init.luau` e,
+/// possivelmente, um `Type.luau` sobrando de antes da migracao (esse e output
+/// do proprio gerador, e agora e escrito em outro lugar — sai junto). Qualquer
+/// outro arquivo la dentro e coisa que a pessoa pos, e ai a pasta fica.
+fn flatten(init: &Path) -> Result<PathBuf> {
+    let folder = init
+        .parent()
+        .with_context(|| format!("{} has no parent folder", init.display()))?;
 
-    if folder.exists() {
-        bail!("cannot move {}: {} already exists", file.display(), folder.display());
+    let mut leftovers = Vec::new();
+    for entry in std::fs::read_dir(folder)
+        .with_context(|| format!("could not read {}", folder.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name != "init.luau" && name != "Type.luau" {
+            leftovers.push(name.to_string());
+        }
+    }
+    if !leftovers.is_empty() {
+        bail!(
+            "{} still holds {} — left as a folder on purpose",
+            folder.display(),
+            leftovers.join(", ")
+        );
     }
 
-    std::fs::create_dir_all(&folder)
-        .with_context(|| format!("could not create {}", folder.display()))?;
-    std::fs::rename(file, &destination)
-        .with_context(|| format!("could not move {}", file.display()))?;
-
-    // A folha que ficou no pai foi escrita para este modulo, e agora pertence a
-    // um caminho que nao existe mais. Sai junto, mas so se nenhum outro modulo
-    // solto ainda a reivindique.
-    let orphan = emit::leaf_path(file);
-    let still_claimed = siblings
-        .iter()
-        .any(|other| other != file && emit::leaf_path(other) == orphan);
-    if !still_claimed && orphan.exists() {
-        let _ = std::fs::remove_file(&orphan);
+    let destination = folder.with_extension("luau");
+    if destination.exists() {
+        bail!("cannot flatten {}: {} already exists", folder.display(), destination.display());
     }
+
+    std::fs::rename(init, &destination)
+        .with_context(|| format!("could not move {}", init.display()))?;
+
+    // A folha antiga e output do gerador e agora vive em Types/. Sai com a
+    // pasta; se ficasse, `is_generated` a trataria como lixo para sempre.
+    let stale = folder.join("Type.luau");
+    if stale.exists() {
+        let _ = std::fs::remove_file(&stale);
+    }
+    let _ = std::fs::remove_dir(folder);
 
     Ok(destination)
 }
@@ -337,38 +362,43 @@ fn reopen(path: &Path) {
         .status();
 }
 
-fn loose_modules(root: &Path, state: &State) -> Vec<PathBuf> {
+/// Modulos escritos como `Foo/init.luau` numa pasta que nao guarda mais nada.
+/// Desde a 0.7.0 essa pasta e um nivel a toa (ver `flatten`).
+fn foldered_modules(root: &Path, state: &State) -> Vec<PathBuf> {
     find_modules(root, &state.layout.source, &state.paths())
         .into_iter()
-        .filter(|p| p.file_name().is_some_and(|n| n != "init.luau"))
+        .filter(|p| p.file_name().is_some_and(|n| n == "init.luau"))
         .collect()
 }
 
 fn fix(root: &Path, source: &Source, layout: manifest::Layout, dry_run: bool, open: bool) -> Result<()> {
     let state = State::new(root, source, layout)?;
-    let loose = loose_modules(root, &state);
+    let foldered = foldered_modules(root, &state);
 
-    if loose.is_empty() {
-        log("every module already has its own folder");
+    if foldered.is_empty() {
+        log("every module is already a file of its own");
         return Ok(());
     }
 
     if dry_run {
-        for file in &loose {
-            println!(
-                "{}  ->  {}",
-                state.rel(file),
-                state.rel(&file.with_file_name(file.file_stem().unwrap_or_default()).join("init.luau"))
-            );
+        for file in &foldered {
+            let Some(folder) = file.parent() else { continue };
+            println!("{}  ->  {}", state.rel(file), state.rel(&folder.with_extension("luau")));
         }
         return Ok(());
     }
 
-    for file in &loose {
-        let destination = relocate(file, &loose)?;
-        log(&format!("{}  ->  {}", state.rel(file), state.rel(&destination)));
-        if open {
-            reopen(&destination);
+    for file in &foldered {
+        match flatten(file) {
+            Ok(destination) => {
+                log(&format!("{}  ->  {}", state.rel(file), state.rel(&destination)));
+                if open {
+                    reopen(&destination);
+                }
+            }
+            // Pasta com conteudo proprio nao e erro de migracao, e escolha de
+            // quem escreveu: reportar e seguir vale mais que abortar o lote.
+            Err(err) => log(&format!("kept {}: {err:#}", state.rel(file))),
         }
     }
 
@@ -376,15 +406,15 @@ fn fix(root: &Path, source: &Source, layout: manifest::Layout, dry_run: bool, op
     Ok(())
 }
 
-/// Um modulo que acabou de aparecer e ainda esta solto. Roda so dentro do
-/// watch, e so depois da primeira pass: ali o cache ja conhece tudo que existia
-/// antes, entao um caminho ausente dele e de fato novo — o arquivo que a pessoa
-/// acabou de criar. Mover o projeto inteiro sem pedir seria outra coisa, e para
-/// isso existe `modux fix`.
+/// Um modulo que acabou de aparecer dentro de uma pasta so dele. Roda so
+/// dentro do watch, e so depois da primeira pass: ali o cache ja conhece tudo
+/// que existia antes, entao um caminho ausente dele e de fato novo — o arquivo
+/// que a pessoa acabou de criar. Achatar o projeto inteiro sem pedir seria
+/// outra coisa, e para isso existe `modux fix`.
 fn autofix(state: &mut State) -> bool {
     let root = state.root.clone();
-    let loose = loose_modules(&root, state);
-    let fresh: Vec<PathBuf> = loose
+    let foldered = foldered_modules(&root, state);
+    let fresh: Vec<PathBuf> = foldered
         .iter()
         .filter(|p| !state.cache.contains_key(*p))
         .cloned()
@@ -392,7 +422,7 @@ fn autofix(state: &mut State) -> bool {
 
     let mut did = false;
     for file in &fresh {
-        match relocate(file, &loose) {
+        match flatten(file) {
             Ok(destination) => {
                 log(&format!("moved: {}  ->  {}", state.rel(file), state.rel(&destination)));
                 reopen(&destination);
@@ -405,11 +435,18 @@ fn autofix(state: &mut State) -> bool {
 }
 
 fn is_generated(path: &Path, targets: &[PathBuf]) -> bool {
+    // Rede de seguranca para projeto anterior a 0.7.0: a folha morava ao lado
+    // do modulo e pode ter sobrado no disco depois da migracao. Nunca deve ser
+    // confundida com um modulo.
     if path.file_name().is_some_and(|n| n == "Type.luau") {
         return true;
     }
     let Ok(a) = path.canonicalize() else { return false };
-    targets.iter().any(|d| d.canonicalize().is_ok_and(|b| a == b))
+    // `starts_with` alem de `==` porque `paths()` agora entrega tambem as
+    // PASTAS de tipo, e o que interessa e tudo que esta dentro delas.
+    targets
+        .iter()
+        .any(|d| d.canonicalize().is_ok_and(|b| a == b || a.starts_with(&b)))
 }
 
 fn find_modules(root: &Path, source: &Path, targets: &[PathBuf]) -> Vec<PathBuf> {
@@ -523,7 +560,43 @@ impl State {
         Ok(true)
     }
 
+    /// Remove de `Types/` toda folha sem modulo correspondente. Devolve se
+    /// apagou alguma coisa.
+    fn sweep_type_dirs(
+        layout: &manifest::Layout,
+        modules: &[Module],
+        sides: &std::collections::BTreeMap<String, rojo::Side>,
+    ) -> Result<bool> {
+        let esperadas: std::collections::BTreeSet<PathBuf> = modules
+            .iter()
+            .map(|m| emit::leaf_path(layout, sides[&m.id], &m.id))
+            .collect();
+
+        let mut apagou = false;
+        for (_, dir) in &layout.types_dirs {
+            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_none_or(|e| e != "luau") {
+                    continue;
+                }
+                if esperadas.contains(&path) {
+                    continue;
+                }
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("could not remove {}", path.display()))?;
+                log(&format!(
+                    "stale leaf removed: {}",
+                    path.display().to_string().replace('\\', "/")
+                ));
+                apagou = true;
+            }
+        }
+        Ok(apagou)
+    }
+
     fn pass(&mut self, verbose: bool) -> Result<bool> {
+        self.ensure_type_dirs();
         let targets_list = find_modules(&self.root, &self.layout.source, &self.paths());
         let seen: Vec<PathBuf> = targets_list.clone();
         self.cache.retain(|k, _| seen.contains(k));
@@ -550,16 +623,31 @@ impl State {
 
         let sides = manifest::validate(&modules, &self.map)?;
 
-        for (target, data) in &pending_leaves {
-            let leaf = emit::leaf_path(target);
-            if Self::write_if_changed(&leaf, &emit::emit(data))? {
+        for (_, data) in &pending_leaves {
+            let leaf = emit::leaf_path(&self.layout, sides[&data.id], &data.id);
+            // O caminho de DataModel do MODULO (nao da folha): e contra ele que
+            // os requires copiados sao absolutizados, ver emit::rewrite_require.
+            let origem = self.map.path(Path::new(&data.file))?;
+            if Self::write_if_changed(&leaf, &emit::emit(data, &origem))? {
                 log(&format!("leaf: {}", self.rel(&leaf)));
                 changed = true;
             }
         }
 
+        // Folha de modulo que nao existe mais.
+        //
+        // Enquanto a folha morava ao lado do modulo, isto era de graca: apagar
+        // a pasta levava a folha junto. Centralizada, ninguem a apaga, e uma
+        // folha obsoleta e pior que um arquivo a toa — ela continua sendo um
+        // ModuleScript valido no DataModel, e o LSP segue oferecendo um tipo de
+        // um modulo que ja morreu, sem nenhum erro em lugar nenhum. E a mesma
+        // familia de bug de entrada obsoleta que custou caro no SyncTeam.
+        if Self::sweep_type_dirs(&self.layout, &modules, &sides)? {
+            changed = true;
+        }
+
         for (side, target) in self.layout.targets.clone() {
-            let Some(text) = manifest::emit(side, &modules, &sides, &self.map)? else {
+            let Some(text) = manifest::emit(side, &modules, &sides, &self.map, &self.layout)? else {
                 continue;
             };
             if Self::write_if_changed(&target, &text)? {
@@ -592,8 +680,27 @@ impl State {
     fn paths(&self) -> Vec<PathBuf> {
         let mut all: Vec<PathBuf> = self.layout.targets.iter().map(|(_, p)| p.clone()).collect();
         all.extend(self.layout.module_lists.iter().map(|(_, p)| p.clone()));
+        // As pastas de tipo inteiras, nao arquivos: tudo la dentro e gerado, e
+        // `is_generated` testa ancestralidade. Sem isto o proprio gerador
+        // encontraria as folhas que acabou de escrever e tentaria trata-las
+        // como modulos.
+        all.extend(self.layout.types_dirs.iter().map(|(_, p)| p.clone()));
         all.push(self.layout.libs_target.clone());
         all
+    }
+
+    /// Cria as pastas de tipo mesmo vazias.
+    ///
+    /// O rogen deriva o project file da estrutura de pastas, e o
+    /// `Map::path` resolve a folha casando o PREFIXO do caminho contra as
+    /// entradas do mapa. Uma pasta que nao existe no disco nao entra no
+    /// project file, e ai a folha nao teria endereco de DataModel nenhum.
+    /// Criar cedo, antes de qualquer escrita, e o que quebra esse
+    /// galinha-e-ovo entre as duas ferramentas.
+    fn ensure_type_dirs(&self) {
+        for (_, dir) in &self.layout.types_dirs {
+            let _ = std::fs::create_dir_all(dir);
+        }
     }
 
     fn check_stale(&mut self) -> Result<Vec<PathBuf>> {
@@ -603,14 +710,14 @@ impl State {
         let sides = manifest::validate(&modules, &self.map)?;
 
         for m in &modules {
-            let leaf = emit::leaf_path(&self.root.join(&m.file));
-            let expected = emit::emit(m);
+            let leaf = emit::leaf_path(&self.layout, sides[&m.id], &m.id);
+            let expected = emit::emit(m, &self.map.path(Path::new(&m.file))?);
             if std::fs::read_to_string(&leaf).ok().as_deref() != Some(expected.as_str()) {
                 stale.push(leaf);
             }
         }
         for (side, target) in self.layout.targets.clone() {
-            let Some(text) = manifest::emit(side, &modules, &sides, &self.map)? else {
+            let Some(text) = manifest::emit(side, &modules, &sides, &self.map, &self.layout)? else {
                 continue;
             };
             if std::fs::read_to_string(&target).ok().as_deref() != Some(text.as_str()) {
