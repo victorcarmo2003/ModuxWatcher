@@ -474,7 +474,10 @@ fn autofix(state: &mut State) -> bool {
     did
 }
 
-fn is_generated(path: &Path, targets: &[PathBuf]) -> bool {
+/// `alvos` ja vem canonicalizado (ver `canonicalizar`): esta funcao roda uma
+/// vez por arquivo `.luau` da arvore, e refazer o canonicalize dos alvos aqui
+/// dentro custava O(arquivos x alvos) chamadas de sistema.
+fn is_generated(path: &Path, alvos: &[PathBuf]) -> bool {
     // Rede de seguranca para projeto anterior a 0.7.0: a folha morava ao lado
     // do modulo e pode ter sobrado no disco depois da migracao. Nunca deve ser
     // confundida com um modulo.
@@ -484,19 +487,25 @@ fn is_generated(path: &Path, targets: &[PathBuf]) -> bool {
     let Ok(a) = path.canonicalize() else { return false };
     // `starts_with` alem de `==` porque `paths()` agora entrega tambem as
     // PASTAS de tipo, e o que interessa e tudo que esta dentro delas.
-    targets
-        .iter()
-        .any(|d| d.canonicalize().is_ok_and(|b| a == b || a.starts_with(&b)))
+    alvos.iter().any(|b| a == *b || a.starts_with(b))
+}
+
+/// Resolve os alvos uma vez so, para `is_generated` nao refazer isso por
+/// arquivo. Alvo que ainda nao existe no disco simplesmente sai da lista — nao
+/// ha arquivo para confundir com ele.
+fn canonicalizar(targets: &[PathBuf]) -> Vec<PathBuf> {
+    targets.iter().filter_map(|t| t.canonicalize().ok()).collect()
 }
 
 fn find_modules(root: &Path, source: &Path, targets: &[PathBuf]) -> Vec<PathBuf> {
+    let alvos = canonicalizar(targets);
     let mut found = Vec::new();
     for entry in WalkDir::new(root.join(source)).into_iter().filter_map(Result::ok) {
         let path = entry.path();
         if !path.is_file() || path.extension().is_none_or(|e| e != "luau") {
             continue;
         }
-        if is_generated(path, targets) {
+        if is_generated(path, &alvos) {
             continue;
         }
         if path.components().any(|c| c.as_os_str() == "Modux") {
@@ -797,13 +806,14 @@ impl State {
 }
 
 fn snapshot(root: &Path, source: &Path, targets: &[PathBuf]) -> BTreeMap<PathBuf, Signature> {
+    let alvos = canonicalizar(targets);
     let mut state = BTreeMap::new();
     for entry in WalkDir::new(root.join(source)).into_iter().filter_map(Result::ok) {
         let path = entry.path();
         if !path.is_file() || path.extension().is_none_or(|e| e != "luau") {
             continue;
         }
-        if is_generated(path, targets) {
+        if is_generated(path, &alvos) {
             continue;
         }
         if let Some(a) = State::signature(path) {
