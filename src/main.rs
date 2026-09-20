@@ -234,15 +234,34 @@ fn run(cli: &Cli) -> Result<()> {
             let source = Source::from(cli, &root);
             let mut state = State::new(&root, &source, layout_for(cli, &source))?;
             let started = Instant::now();
-            if !state.pass(true)? {
-                log("up to date");
+            // A primeira passada NAO pode propagar o erro de caminho.
+            //
+            // Num projeto que ainda nao tem a pasta de folhas, ela escreve as
+            // folhas e so entao descobre que o project file nao as conhece —
+            // o rogen so passa a enxergar a pasta depois que ela tem `.luau`
+            // dentro. Com `?` aqui o processo morria antes de `watch_loop`
+            // comecar, e o loop e justamente quem sabe esperar: o rogen ao
+            // lado reescreve o project file, o loop releh o mapa e a passada
+            // seguinte fecha.
+            //
+            // Sintoma de antes: `modux watch` saia na hora, sem nunca imprimir
+            // "watching src/". Quem rodava a tarefa do VS Code via o painel
+            // fechar sozinho e nao tinha como saber que bastava rodar de novo.
+            match state.pass(true) {
+                Ok(false) => log("up to date"),
+                Ok(true) => {}
+                Err(err) if format!("{err:#}").contains("outside") => {
+                    log("waiting for rogen to pick up the leaves folder")
+                }
+                Err(err) => return Err(err),
             }
             log(&format!("primeira pass em {} ms", started.elapsed().as_millis()));
             if *autofix_on {
                 let foldered = foldered_modules(&root, &state).len();
                 if foldered > 0 {
                     log(&format!(
-                        "{foldered} module(s) still in a folder of their own; run `modux fix` for those.                          From here on, a new one is flattened as it appears"
+                        "{foldered} module(s) still in a folder of their own; run `modux fix` \
+                         for those. From here on, a new one is flattened as it appears"
                     ));
                 }
             }
@@ -1052,7 +1071,11 @@ fn watch_loop(
             // so estara quando o rogen correr. Enquanto isso a geracao nao tem
             // como resolver o caminho — e espera, nao falha, entao nao se
             // anuncia como erro.
-            Err(err) if just_moved && format!("{err:#}").contains("outside") => {
+            // Nao so depois de um move: a pasta de folhas de um projeto novo
+            // tambem nasce fora do project file, e nos dois casos isto e
+            // espera, nao falha.
+            Err(err) if format!("{err:#}").contains("outside") => {
+                let _ = just_moved;
                 log("waiting for rogen to pick up the new folder")
             }
             // Sintaxe incompleta enquanto se digita nao e falha do projeto: o
