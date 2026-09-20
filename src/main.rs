@@ -362,6 +362,32 @@ fn reopen(path: &Path) {
         .status();
 }
 
+/// Folhas de antes da 0.7.0: o `Type.luau` que ficou ao lado do modulo.
+///
+/// O `flatten` so remove a folha antiga da pasta que ele achata. Um modulo que
+/// MANTEVE a pasta (porque guarda um irmao de verdade, como o ProfileService
+/// do template com o seu Template.luau) fica com a folha velha no disco para
+/// sempre — e `is_generated` a ignora pelo nome, entao o gerador nunca mais
+/// olha para ela.
+///
+/// Isso e pior que um arquivo a toa: ela continua sendo um ModuleScript valido
+/// no DataModel, com uma copia DESATUALIZADA do tipo que ninguem atualiza. O
+/// nome `Type.luau` sempre foi reservado para output do gerador (e o que
+/// `is_generated` assume desde antes desta mudanca), entao remove-la na
+/// migracao e legitimo.
+fn legacy_leaves(root: &Path, state: &State) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = find_modules(root, &state.layout.source, &state.paths())
+        .into_iter()
+        .filter_map(|m| {
+            let leaf = m.parent()?.join("Type.luau");
+            leaf.exists().then_some(leaf)
+        })
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
 /// Modulos escritos como `Foo/init.luau` numa pasta que nao guarda mais nada.
 /// Desde a 0.7.0 essa pasta e um nivel a toa (ver `flatten`).
 fn foldered_modules(root: &Path, state: &State) -> Vec<PathBuf> {
@@ -374,8 +400,9 @@ fn foldered_modules(root: &Path, state: &State) -> Vec<PathBuf> {
 fn fix(root: &Path, source: &Source, layout: manifest::Layout, dry_run: bool, open: bool) -> Result<()> {
     let state = State::new(root, source, layout)?;
     let foldered = foldered_modules(root, &state);
+    let legacy = legacy_leaves(root, &state);
 
-    if foldered.is_empty() {
+    if foldered.is_empty() && legacy.is_empty() {
         log("every module is already a file of its own");
         return Ok(());
     }
@@ -384,6 +411,9 @@ fn fix(root: &Path, source: &Source, layout: manifest::Layout, dry_run: bool, op
         for file in &foldered {
             let Some(folder) = file.parent() else { continue };
             println!("{}  ->  {}", state.rel(file), state.rel(&folder.with_extension("luau")));
+        }
+        for leaf in &legacy {
+            println!("{}  ->  (removida)", state.rel(leaf));
         }
         return Ok(());
     }
@@ -402,7 +432,17 @@ fn fix(root: &Path, source: &Source, layout: manifest::Layout, dry_run: bool, op
         }
     }
 
-    log("run `modux generate` to write the leaves in their new place");
+    // Depois dos flattens: um modulo achatado ja levou a sua folha junto, e o
+    // que sobra aqui e de quem manteve a pasta.
+    for leaf in legacy_leaves(root, &state) {
+        match std::fs::remove_file(&leaf) {
+            Ok(()) => log(&format!("folha anterior a 0.7.0 removida: {}", state.rel(&leaf))),
+            Err(err) => log(&format!("could not remove {}: {err:#}", state.rel(&leaf))),
+        }
+    }
+
+    log("run `modux generate` to write the leaves in their new place,");
+    log("then `rogen build` again so Types/ enters the project file");
     Ok(())
 }
 
@@ -632,6 +672,19 @@ impl State {
                 log(&format!("leaf: {}", self.rel(&leaf)));
                 changed = true;
             }
+        }
+
+        // Folha anterior a 0.7.0 ainda ao lado do modulo (ver legacy_leaves):
+        // aqui so avisa, nunca apaga. Remover arquivo fora de `Types/` e ato de
+        // migracao, e migracao se pede — `modux fix`.
+        let legadas = targets_list
+            .iter()
+            .filter(|t| t.parent().is_some_and(|p| p.join("Type.luau").exists()))
+            .count();
+        if legadas > 0 {
+            log(&format!(
+                "{legadas} folha(s) anterior(es) a 0.7.0 ao lado do modulo, com uma copia desatualizada do tipo; `modux fix` remove"
+            ));
         }
 
         // Folha de modulo que nao existe mais.
