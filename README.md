@@ -13,19 +13,24 @@ continua Luau válido que roda.
 
 ```sh
 rokit add luau-lang/luau
-rokit add victorcarmo2003/modux
+rokit add victorcarmo2003/ModuxWatcher
 rokit install
 ```
 
 Na primeira vez o Rokit pede para você confirmar que confia na ferramenta:
 
 ```
-ERROR The following tool has not been marked as trusted: victorcarmo2003/modux
-Run `rokit add victorcarmo2003/modux` to install and trust this tool.
+ERROR The following tool has not been marked as trusted: victorcarmo2003/ModuxWatcher
+Run `rokit add victorcarmo2003/ModuxWatcher` to install and trust this tool.
 ```
 
 É só rodar o mesmo comando de novo num terminal interativo e aceitar. Em CI, use
-`rokit trust victorcarmo2003/modux` antes do `rokit install`.
+`rokit trust victorcarmo2003/ModuxWatcher` antes do `rokit install`.
+
+> **Vinha da 0.6.x?** O repositório se chamava `victorcarmo2003/modux` até a
+> 0.7.0. O GitHub redireciona o nome antigo, mas o Rokit trata `ModuxWatcher`
+> como uma ferramenta **diferente** — a confiança que você já tinha dado não
+> vale para ela, e o passo acima acontece de novo. Uma vez só.
 
 Não tem mais nada para instalar: o parser de Luau é compilado dentro do binário.
 Versões até a 0.1 dependiam do `luau-ast` no PATH, o que não dava para resolver com
